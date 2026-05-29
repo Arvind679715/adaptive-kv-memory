@@ -91,7 +91,7 @@ def cmd_info(args: argparse.Namespace) -> None:
 
     print("\nFeatures:")
     print(f"  Triton kernels: {akv.HAS_TRITON}")
-    print(f"  TurboQuant: available")
+    print(f"  NormQuant: available")
     print(f"  Production cache: available")
     print(f"  HF integration: available")
 

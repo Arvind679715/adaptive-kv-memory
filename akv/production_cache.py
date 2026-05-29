@@ -65,7 +65,7 @@ class ProductionCacheConfig:
     scoring_strategy: str = "fifo"  # "hybrid", "fifo", "recency_weighted", etc.
 
     # Device
-    device: str = "cuda"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.float16
 
 

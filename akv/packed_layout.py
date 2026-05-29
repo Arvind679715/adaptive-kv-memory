@@ -34,7 +34,7 @@ class PackedKVConfig:
     head_dim: int = 128
     bits: int = 4          # 2 or 4
     group_size: int = 128  # per-head group quantization
-    device: str = "cuda"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.float16
 
     @property
@@ -303,7 +303,7 @@ class PagedKVCache:
         page_size: int = 16,     # tokens per page
         max_pages: int = 4096,   # total page pool size
         dtype: torch.dtype = torch.float16,
-        device: str = "cuda",
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.num_layers = num_layers
         self.num_heads = num_heads

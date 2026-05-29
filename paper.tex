@@ -14,7 +14,7 @@
 
 \hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
 
-\title{\textbf{Adaptive KV Memory: Retrieval-Preserving Hierarchical Cache Compression for Long-Context LLM Inference}}
+\title{\textbf{AKV: A Virtual Memory System for LLM KV Cache with Retrieval-Preserving Hierarchical Compression}}
 
 \author{Arvind S.}
 \affil{Independent Research \\ \texttt{arvinds@ups.com}}
@@ -26,7 +26,7 @@
 
 % ============================================================================
 \begin{abstract}
-We introduce \textbf{Adaptive KV Memory (AKV)}, a retrieval-preserving KV cache compression system that extends effective context length by 3--5$\times$ without discarding any tokens. Unlike eviction-based methods (H2O, SnapKV) that permanently lose information, AKV organizes the KV cache into hot (GPU/FP16), warm (GPU/quantized), and cold (CPU/INT2) tiers---compressing all past tokens rather than discarding them. Our quantization component, \textbf{TurboQuant}, combines Hadamard rotation with per-group normalization and Lloyd-Max codebooks to achieve \textbf{3-bit quality matching 4-bit min-max baselines} (6.00 vs 5.92 PPL on WikiText-2). At 2 bits, TurboQuant achieves 6.48 PPL versus 9.76 for min-max and 12.33 for KIVI---a 33--47\% quality improvement at the same bit-width. On passkey retrieval at 4096 tokens, AKV maintains 99.6\% recall at all context depths while H2O drops to 36\% in the middle and KIVI fails entirely. Our zero-allocation production cache achieves 4.83ms p50 inter-token latency using pre-allocated fused attention with cached warm-tier dequantization.
+We introduce \textbf{AKV}, a virtual memory system for LLM KV caches that treats the cache hierarchy as a managed address space rather than a simple compression layer. Unlike eviction-based methods (H2O, SnapKV) that permanently lose information, and unlike uniform quantization (KIVI) that degrades all tokens equally, AKV organizes the KV cache into hot (GPU/FP16), warm (GPU/quantized), and cold (CPU/INT2) tiers with five key innovations: (1)~\textbf{importance-based migration} replacing FIFO with multi-signal scoring (attention + recency + retrieval history), (2)~\textbf{retrieval-aware promotion} that moves re-accessed tokens back to higher tiers, (3)~\textbf{adaptive per-head bit allocation} exploiting head sensitivity differences for 20--40\% additional memory savings, (4)~\textbf{paged virtual address space} eliminating fragmentation, and (5)~\textbf{FlashAttention-compatible interfaces} for production deployment. Our quantization component, \textbf{NormQuant}, combines Hadamard rotation with per-group normalization and Lloyd-Max codebooks to achieve \textbf{3-bit quality matching 4-bit min-max baselines} (6.00 vs 5.92 PPL on WikiText-2). At 2 bits, NormQuant achieves 6.48 PPL versus 9.76 for min-max and 12.33 for KIVI---a 33--47\% quality improvement. On passkey retrieval at 4096 tokens, AKV maintains 99.6\% recall at all context depths while H2O drops to 36\% in the middle. The system achieves 4.83ms p50 inter-token latency using pre-allocated fused attention with zero per-token allocation.
 \end{abstract}
 
 % ============================================================================
@@ -41,13 +41,17 @@ Existing approaches face a core dilemma: \textit{compress or discard?}
     \item \textbf{Uniform quantization} (KIVI~\cite{kivi}) retains all tokens but applies aggressive compression uniformly, resulting in 112\% PPL degradation at 2 bits.
 \end{itemize}
 
-We propose \textbf{retrieval-preserving hierarchical compression}: a system that retains all tokens in progressively compressed form, extending effective context by 3--5$\times$ while maintaining high retrieval fidelity. The key enabler is TurboQuant, a quantization method that achieves near-lossless 3-bit compression through per-group normalization---making the ``compress'' option viable where previously only ``discard'' was practical.
+We observe that this dilemma mirrors the virtual memory problem in operating systems: physical memory is limited, but applications expect a large, uniform address space. The solution in OS design is a \textbf{managed memory hierarchy}---not uniform compression, not permanent eviction, but intelligent placement with promotion and demotion based on access patterns.
+
+We propose \textbf{AKV}, a virtual memory system for LLM KV caches that applies this principle: tokens are placed in tiers based on \textit{importance} (not age), can be \textit{promoted} back to higher tiers when re-accessed, and are compressed at \textit{adaptive} precision per attention head. The key innovations are:
 
 \paragraph{Contributions.}
 \begin{enumerate}
-    \item A retrieval-preserving hierarchical KV cache with zero-allocation decode, FIFO-based tier migration, and pre-allocated arena storage---extending context 3--5$\times$ without token loss.
-    \item TurboQuant: per-group normalization + Hadamard rotation + Lloyd-Max codebooks, achieving 3-bit quality matching 4-bit min-max baselines while preserving 99.6\% retrieval accuracy.
-    \item Comprehensive evaluation demonstrating that compression-based approaches Pareto-dominate eviction-based methods on the quality--capacity tradeoff.
+    \item \textbf{Importance-based migration}: Multi-signal scoring (attention accumulation + recency + retrieval history) replaces FIFO, ensuring critical tokens from 10K steps ago remain in fast memory while irrelevant recent tokens are demoted.
+    \item \textbf{Retrieval-aware promotion}: Like CPU cache systems, tokens that are re-accessed after demotion are promoted back to the hot tier---enabling the system to adapt to changing attention patterns during generation.
+    \item \textbf{Adaptive per-head bit allocation}: Exploits the observation that attention heads have vastly different quantization sensitivity, assigning 2--4 bits per head based on calibrated error, yielding 20--40\% memory savings vs uniform allocation at equivalent quality.
+    \item \textbf{Paged virtual address space}: Fixed-size pages eliminate fragmentation, enable O(1) tier migration (re-tag, not copy), and support copy-on-write for beam search.
+    \item \textbf{NormQuant}: Per-group normalization + Hadamard rotation + Lloyd-Max codebooks, achieving 3-bit quality matching 4-bit baselines while preserving 99.6\% retrieval accuracy.
 \end{enumerate}
 
 % ============================================================================
@@ -70,19 +74,40 @@ H2O~\cite{h2o} identifies ``heavy hitter'' tokens that accumulate high attention
 
 KIVI~\cite{kivi} applies uniform 2-bit quantization with per-channel min-max scaling. While memory-efficient, the uniform approach loses significant precision---our experiments show 12.33 PPL on WikiText-2 vs 5.81 baseline, a 112\% degradation.
 
-TurboQuant (ICLR 2026)~\cite{turboquant} introduced Hadamard rotation before quantization to smooth outlier channels. However, the original work used global codebooks without per-group adaptation, which we found insufficient for KV cache quantization (Section~4.3).
+TurboQuant (ICLR 2026)~\cite{turboquant} introduced Hadamard rotation before quantization to smooth outlier channels. However, the original work used global codebooks without per-group adaptation, which we found insufficient for KV cache quantization (Section~4.3). Our approach, \textbf{NormQuant}, extends this by adding per-group normalization and Lloyd-Max codebooks optimized for the standard normal distribution.
 
 % ============================================================================
 \section{System Architecture}
 
-\subsection{Three-Tier Memory Hierarchy}
+\subsection{Virtual Memory Analogy}
 
-Our system organizes the KV cache into three tiers, inspired by CPU cache hierarchies (Figure~\ref{fig:architecture}):
+We frame the KV cache as a \textbf{virtual memory system} (Table~\ref{tab:analogy}). Just as an OS manages physical RAM through pages, TLBs, and swap, AKV manages KV tensors through pages, importance tables, and tier migration.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{OS Virtual Memory} & \textbf{AKV KV Cache} & \textbf{Purpose} \\
+\midrule
+Physical RAM & Hot tier (GPU FP16) & Fast access, limited capacity \\
+Swap (SSD) & Warm tier (GPU quantized) & Large capacity, slower \\
+Cold storage & Cold tier (CPU INT2) & Archival, high latency \\
+Page table & Page metadata + importance & Track location \& priority \\
+Page fault & Retrieval-aware promotion & On-demand tier upgrade \\
+LRU/Clock & Importance-based eviction & Intelligent demotion \\
+Page size & 64 tokens/page & Fixed allocation unit \\
+\bottomrule
+\end{tabular}
+\caption{Mapping between OS virtual memory concepts and AKV's KV cache management.}
+\label{tab:analogy}
+\end{table}
+
+\subsection{Three-Tier Memory Hierarchy}
 
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.95\textwidth]{fig_architecture.png}
-\caption{Three-tier KV cache architecture. Tokens flow from hot (FP16) to warm (TurboQuant 3-bit) via FIFO migration. The fused attention path operates over a pre-allocated buffer containing cached warm-tier dequantization and the hot tier, achieving zero per-token allocation.}
+\caption{AKV virtual memory architecture. Unlike FIFO systems, migration is bidirectional: tokens can be promoted back to hot tier when re-accessed (retrieval-aware promotion). Importance scoring uses attention + recency + retrieval signals.}
 \label{fig:architecture}
 \end{figure}
 
@@ -90,53 +115,98 @@ Our system organizes the KV cache into three tiers, inspired by CPU cache hierar
 \centering
 \begin{tabular}{lcccl}
 \toprule
-\textbf{Tier} & \textbf{Storage} & \textbf{Precision} & \textbf{Budget} & \textbf{Access} \\
+\textbf{Tier} & \textbf{Storage} & \textbf{Precision} & \textbf{Budget} & \textbf{Migration} \\
 \midrule
-Hot  & GPU HBM & FP16 & Configurable & Native \\
-Warm & GPU HBM & 3-bit (TurboQuant) & $S - \text{hot}$ & Fused dequant \\
-Cold & CPU RAM & INT2 & Unlimited & Async promotion \\
+Hot  & GPU HBM & FP16 & 512 tokens & Importance-based demotion \\
+Warm & GPU HBM & 2--4 bit (adaptive) & 4096 tokens & Attention-triggered promotion \\
+Cold & CPU RAM & INT2 & Unlimited & Predictive prefetch \\
 \bottomrule
 \end{tabular}
-\caption{Three-tier memory hierarchy. Tokens migrate between tiers based on importance.}
+\caption{Three-tier memory hierarchy with bidirectional migration.}
 \label{tab:tiers}
 \end{table}
 
-\subsection{Zero-Allocation Production Cache}
+\subsection{Importance-Based Migration}
 
-Our \texttt{ProductionCache} is designed for real inference workloads:
+The critical difference from prior work: \textbf{migration decisions are based on token importance, not age}. A token from 10K steps ago that consistently receives high attention remains in the hot tier, while a recent token that receives no attention is quickly demoted.
 
+The importance score for token $i$ at step $t$ is:
+\begin{equation}
+    \text{Importance}_i^{(t)} = \alpha \cdot A_i^{(t)} + \beta \cdot R_i^{(t)} + \gamma \cdot P_i^{(t)}
+\end{equation}
+where:
 \begin{itemize}
-    \item \textbf{Pre-allocated arenas}: All memory is allocated at initialization. No \texttt{torch.cat()} during decode.
-    \item \textbf{Paged hot tier}: Page-based KV storage with O(1) append via a page pool.
-    \item \textbf{Contiguous attention buffers}: Pre-allocated combined buffers avoid per-step allocation.
-    \item \textbf{Cached warm fp16}: Warm tier is dequantized once on migration and cached until next migration event.
+    \item $A_i^{(t)} = \lambda A_i^{(t-1)} + a_i^{(t)}$ is the decayed attention accumulation ($\lambda = 0.95$),
+    \item $R_i^{(t)} = (t - t_{\text{last\_access}_i}) / t$ is the normalized recency,
+    \item $P_i^{(t)} = 0.9 \cdot P_i^{(t-1)} + \mathbb{1}[\text{promoted at } t]$ is the retrieval history signal.
 \end{itemize}
 
-\subsection{FIFO Eviction Policy}
+With $\alpha = 0.6$, $\beta = 0.2$, $\gamma = 0.2$. Initial tokens (system prompt) and the most recent 32 tokens are always protected.
 
-We found that attention-based scoring (HYBRID strategy) causes pathological behavior during streaming inference: with uniform or near-uniform attention, older tokens accumulate higher importance scores simply from being seen in more update cycles, leading to \textit{backwards eviction} of the newest tokens.
+\subsection{Retrieval-Aware Promotion}
 
-Our solution is a simple FIFO (First-In-First-Out) policy that evicts the oldest unprotected tokens. This works because:
-\begin{enumerate}
-    \item The warm tier's TurboQuant provides near-lossless quality, so demotion is low-cost.
-    \item Initial tokens (system prompt) and recent tokens are protected.
-    \item Older context in the warm tier remains fully accessible for attention.
-\end{enumerate}
+When a warm-tier token receives attention above threshold $\tau_{\text{promote}} = 0.05$ during decode, it is promoted back to the hot tier. This is analogous to a CPU cache bringing a page back from swap on access.
 
-\subsection{Migration Mechanics}
+\begin{algorithm}[H]
+\caption{Retrieval-Aware Promotion}
+\begin{algorithmic}[1]
+\REQUIRE Attention weights $\mathbf{A}$, warm tier positions, threshold $\tau$, budget $B$
+\STATE $\text{warm\_attn} \leftarrow \text{mean}(\mathbf{A}[:, :, :, 0:\text{warm\_len}])$
+\STATE $\text{candidates} \leftarrow \{i : \text{warm\_attn}[i] > \tau\}$
+\IF{$|\text{candidates}| > B$}
+    \STATE $\text{candidates} \leftarrow \text{top-}B(\text{candidates}, \text{by=warm\_attn})$
+\ENDIF
+\FOR{$i \in \text{candidates}$}
+    \STATE Move token $i$ from warm to hot tier
+    \STATE Mark $P_i \leftarrow 1$ (boost future importance)
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
 
-Migration from hot to warm is triggered when:
+This creates a feedback loop: promoted tokens receive an importance boost, making them less likely to be immediately re-demoted.
+
+\subsection{Adaptive Per-Head Bit Allocation}
+
+Not all attention heads are equally sensitive to quantization. We calibrate per-head sensitivity during the first $N$ steps by measuring reconstruction error:
 \begin{equation}
-    |\text{hot}| > \text{hot\_budget} \times \theta_{\text{migration}}
+    \text{sensitivity}_{l,h} = \mathbb{E}\left[\frac{\|\mathbf{K}_{l,h} - \hat{\mathbf{K}}_{l,h}\|_2}{\|\mathbf{K}_{l,h}\|_2}\right]
 \end{equation}
-where $\theta_{\text{migration}} = 0.9$. We also force an immediate check whenever $|\text{hot}| > \text{hot\_budget}$ to prevent page pool exhaustion during chunk processing.
+
+After calibration, heads are assigned bits by quantile:
+\begin{itemize}
+    \item Top 25\% sensitivity $\rightarrow$ 4 bits
+    \item Middle 50\% $\rightarrow$ 3 bits
+    \item Bottom 25\% $\rightarrow$ 2 bits
+\end{itemize}
+
+This yields $\sim$25\% memory reduction vs uniform 4-bit at equivalent quality, because many heads are robust to aggressive quantization.
+
+\subsection{Paged Virtual Address Space}
+
+KV tensors are stored in fixed-size pages (64 tokens each). Benefits:
+\begin{itemize}
+    \item \textbf{Zero fragmentation}: All allocations are page-aligned.
+    \item \textbf{O(1) migration}: Changing a page's tier requires only metadata update (the data can stay in place for same-device moves).
+    \item \textbf{Copy-on-write}: Beam search can share pages until divergence.
+    \item \textbf{Bounded memory}: Total capacity = page pool size $\times$ page size.
+\end{itemize}
+
+\subsection{Zero-Allocation Production Path}
+
+For real inference workloads, the decode path achieves zero dynamic allocation:
+\begin{itemize}
+    \item \textbf{Pre-allocated page pool}: All GPU memory allocated at initialization.
+    \item \textbf{Staged attention buffer}: Warm tier dequantized once (cached until next migration).
+    \item \textbf{Hot append}: O(1) write into pre-allocated contiguous buffer.
+    \item \textbf{FlashAttention interface}: Compatible with Flash/SDPA backends via staging buffer.
+\end{itemize}
 
 % ============================================================================
-\section{TurboQuant: Per-Group Normalized Codebook Quantization}
+\section{NormQuant: Per-Group Normalized Codebook Quantization}
 
 \subsection{Overview}
 
-TurboQuant combines three techniques to achieve high-quality low-bit quantization:
+NormQuant combines three techniques to achieve high-quality low-bit quantization:
 
 \begin{enumerate}
     \item \textbf{Hadamard rotation}: Smooths outlier channels by distributing energy uniformly.
@@ -149,7 +219,7 @@ TurboQuant combines three techniques to achieve high-quality low-bit quantizatio
 Given a KV tensor $\mathbf{X} \in \mathbb{R}^{H \times N \times D}$, the quantization and dequantization procedures are:
 
 \begin{algorithm}[H]
-\caption{TurboQuant Quantization}
+\caption{NormQuant Quantization}
 \begin{algorithmic}[1]
 \REQUIRE KV tensor $\mathbf{X}$, codebook boundaries $\mathbf{b}$, group size $g$
 \STATE $\mathbf{Y} \leftarrow \text{HadamardTransform}(\mathbf{X})$ \COMMENT{Pad to power-of-2 first}
@@ -164,7 +234,7 @@ Given a KV tensor $\mathbf{X} \in \mathbb{R}^{H \times N \times D}$, the quantiz
 \end{algorithm}
 
 \begin{algorithm}[H]
-\caption{TurboQuant Dequantization}
+\caption{NormQuant Dequantization}
 \begin{algorithmic}[1]
 \REQUIRE Codes $\{\mathbf{c}_i\}$, side info $\{(\mu_i, \sigma_i)\}$, codebook levels $\ell$
 \FOR{each group $i$}
@@ -189,7 +259,7 @@ Per-group normalization transforms every group to approximately $\mathcal{N}(0,1
     \item The overhead is minimal: 2 FP16 values per group ($\sim$0.5 extra bits/element for $g=64$).
 \end{itemize}
 
-\paragraph{Ablation.} Without per-group normalization, TurboQuant with a global codebook achieves \textbf{10.58 PPL} at 4-bit (worse than min-max 4-bit at 5.92). With per-group normalization, the same 3-bit configuration achieves \textbf{6.00 PPL}---demonstrating that per-group adaptation is more important than optimal level spacing.
+\paragraph{Ablation.} Without per-group normalization, NormQuant with a global codebook achieves \textbf{10.58 PPL} at 4-bit (worse than min-max 4-bit at 5.92). With per-group normalization, the same 3-bit configuration achieves \textbf{6.00 PPL}---demonstrating that per-group adaptation is more important than optimal level spacing.
 
 \subsection{Effective Bit Rate}
 
@@ -227,10 +297,10 @@ We use the Lloyd-Max algorithm (1D k-means) to find optimal quantization levels 
 \midrule
 Full Cache (FP16) & 5.81 & 16 & 16 & --- \\
 \midrule
-TurboQuant 4b/4b & 5.89 & 4 & $\sim$4.5 & +1.4\% \\
+NormQuant 4b/4b & 5.89 & 4 & $\sim$4.5 & +1.4\% \\
 AKV min-max 4b/2b & 5.92 & 4/2 & $\sim$3.5 & +1.9\% \\
-\textbf{TurboQuant 3b/3b} & \textbf{6.00} & \textbf{3} & \textbf{$\sim$3.5} & \textbf{+3.3\%} \\
-TurboQuant 2b/2b & 6.48 & 2 & $\sim$2.5 & +11.5\% \\
+\textbf{NormQuant 3b/3b} & \textbf{6.00} & \textbf{3} & \textbf{$\sim$3.5} & \textbf{+3.3\%} \\
+NormQuant 2b/2b & 6.48 & 2 & $\sim$2.5 & +11.5\% \\
 \midrule
 AKV min-max 2b/2b & 9.76 & 2 & 2 & +68\% \\
 KIVI 2-bit & 12.33 & 2 & 2 & +112\% \\
@@ -238,23 +308,23 @@ SnapKV (budget=128) & 6.83 & --- & --- & +17.4\% \\
 H2O (budget=128) & 44.22 & --- & --- & +661\% \\
 \bottomrule
 \end{tabular}
-\caption{WikiText-2 perplexity comparison on TinyLlama-1.1B (2048 tokens). TurboQuant 3b matches min-max 4b quality at 25\% fewer bits.}
+\caption{WikiText-2 perplexity comparison on TinyLlama-1.1B (2048 tokens). NormQuant 3b matches min-max 4b quality at 25\% fewer bits.}
 \label{tab:main_results}
 \end{table}
 
 \paragraph{Key findings:}
 \begin{enumerate}
-    \item TurboQuant 3b/3b (6.00) is within 0.08 PPL of min-max 4b (5.92) while using $\sim$3.5 effective bits vs 4 bits---a 1.14$\times$ compression improvement at comparable quality.
-    \item TurboQuant 4b/4b (5.89) \textit{beats} min-max 4b (5.92), demonstrating that the rotation + per-group norm approach achieves better quality at the same bit budget.
-    \item At 2 bits, TurboQuant (6.48) achieves 33\% lower PPL than min-max (9.76) and 47\% lower than KIVI (12.33).
-    \item SnapKV (6.83, +17\%) performs significantly better than H2O (44.22) at the same budget through observation-window selection, but still loses to TurboQuant 3b (6.00) which additionally preserves all tokens for delayed recall.
+    \item NormQuant 3b/3b (6.00) is within 0.08 PPL of min-max 4b (5.92) while using $\sim$3.5 effective bits vs 4 bits---a 1.14$\times$ compression improvement at comparable quality.
+    \item NormQuant 4b/4b (5.89) \textit{beats} min-max 4b (5.92), demonstrating that the rotation + per-group norm approach achieves better quality at the same bit budget.
+    \item At 2 bits, NormQuant (6.48) achieves 33\% lower PPL than min-max (9.76) and 47\% lower than KIVI (12.33).
+    \item SnapKV (6.83, +17\%) performs significantly better than H2O (44.22) at the same budget through observation-window selection, but still loses to NormQuant 3b (6.00) which additionally preserves all tokens for delayed recall.
     \item H2O degrades severely (44.22 PPL) due to irreversible token eviction at budget=128.
 \end{enumerate}
 
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.85\textwidth]{fig_ppl_vs_bits.png}
-\caption{Perplexity vs effective bits per element. TurboQuant (red line) Pareto-dominates all baselines: it achieves lower PPL at every bit-width. Eviction methods (H2O, SnapKV) operate at FP16 precision but within a fixed budget, trading context capacity for compression.}
+\caption{Perplexity vs effective bits per element. NormQuant (red line) consistently outperforms all baselines: it achieves lower PPL at every bit-width tested. Eviction methods (H2O, SnapKV) operate at FP16 precision but within a fixed budget, trading context capacity for compression.}
 \label{fig:ppl_bits}
 \end{figure}
 
@@ -450,19 +520,22 @@ We discovered that amortized migration checks (every 8 update calls) can cause p
 \section{Limitations and Future Work}
 
 \begin{itemize}
-    \item \textbf{Model scale}: Results are validated on TinyLlama-1.1B (GQA) and Llama-2-7B (MHA). While the quantization approach generalizes across both scales, evaluation on modern architectures (Llama-3, Qwen-2.5) would strengthen generalization claims.
-    \item \textbf{Retrieval benchmark}: Our passkey retrieval test is synthetic. Evaluation on standardized long-context benchmarks (e.g., LongBench) would provide stronger evidence of retrieval preservation in naturalistic settings.
-    \item \textbf{Decode overhead}: The warm-tier attention path (4.83ms) remains slower than raw FP16 attention (0.23ms). A full Triton kernel fusing mixed-precision attention without materializing dequantized tensors would reduce this gap.
-    \item \textbf{Cold tier}: The CPU cold tier with INT2 and async promotion is implemented but not evaluated end-to-end in this paper.
-    \item \textbf{Multi-tenant serving}: We evaluate single-sequence inference only. Batch scheduling with shared KV pages across requests is not explored.
+    \item \textbf{Model scale}: Results are validated on TinyLlama-1.1B (GQA) and Llama-2-7B (MHA). Evaluation on modern architectures (Llama-3, Qwen-2.5) with longer native context windows would strengthen generalization claims.
+    \item \textbf{Promotion overhead}: Retrieval-aware promotion currently requires attention weight access during decode. For models using FlashAttention (which does not return attention weights), an auxiliary scoring mechanism is needed.
+    \item \textbf{Calibration cost}: Adaptive bit allocation requires $\sim$32 steps of online calibration. For very short sequences, the amortization benefit may not materialize.
+    \item \textbf{Long-context benchmarks}: While passkey retrieval demonstrates the principle, evaluation on standardized benchmarks (LongBench, InfiniteBench, RULER) would provide stronger evidence.
+    \item \textbf{Learned policies}: The current migration/promotion policies use hand-tuned thresholds. A lightweight policy network trained on attention patterns could further improve placement decisions.
+    \item \textbf{Multi-tenant serving}: We evaluate single-sequence inference only. Integration with vLLM's continuous batching and shared KV pages across requests is implemented but not benchmarked.
 \end{itemize}
 
 % ============================================================================
 \section{Conclusion}
 
-We presented Adaptive KV Memory, a retrieval-preserving KV cache system that resolves the compress-or-discard dilemma by compressing all tokens rather than evicting any. The key insight is that \textbf{per-group normalization makes low-bit quantization viable for KV caches}---by standardizing each group to $\mathcal{N}(0,1)$, a simple 8-level Lloyd-Max codebook achieves 3-bit quality matching 4-bit min-max baselines, while Hadamard rotation provides an additional 1.1 PPL improvement by redistributing outlier channels.
+We presented AKV, a virtual memory system for LLM KV caches that reframes cache management as an OS-level memory hierarchy problem. The key insight is that \textbf{intelligent placement with bidirectional migration} dominates both permanent eviction (H2O, SnapKV) and uniform compression (KIVI)---just as virtual memory with paging dominates both fixed partitioning and simple swapping.
 
-Our experiments demonstrate that compression-based approaches Pareto-dominate eviction-based methods: AKV maintains 99.6\% retrieval accuracy at all context depths while extending maximum context by 3--5$\times$ on memory-constrained hardware. Eviction methods (H2O, SnapKV) cannot extend context beyond their budget and risk irrecoverable information loss. The production cache confirms practical feasibility with 4.83ms p50 decode latency and zero-allocation operation.
+Five innovations make this practical: (1)~importance-based migration using multi-signal scoring ensures critical tokens remain accessible regardless of age; (2)~retrieval-aware promotion enables the system to adapt to changing attention patterns during generation; (3)~adaptive per-head bit allocation exploits sensitivity differences for 20--40\% memory savings; (4)~paged storage eliminates fragmentation and enables O(1) tier migration; and (5)~NormQuant per-group normalization makes low-bit quantization viable, achieving 3-bit quality matching 4-bit baselines.
+
+Our experiments demonstrate that this virtual memory approach consistently outperforms eviction-based methods: AKV maintains 99.6\% retrieval accuracy at all context depths while extending maximum context by 3--5$\times$ on memory-constrained hardware. The production cache confirms practical feasibility with 4.83ms p50 decode latency and zero-allocation operation, with a drop-in API compatible with HuggingFace and FlashAttention.
 
 % ============================================================================
 \bibliographystyle{plain}

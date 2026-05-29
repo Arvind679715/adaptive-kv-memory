@@ -13,7 +13,7 @@ outlier_channels = [3, 17, 45, 89, 112]
 keys[:, :, outlier_channels] *= 15.0
 values[:, :, outlier_channels] *= 8.0
 
-print('=== Quality Comparison: TurboQuant vs Min-Max ===')
+print('=== Quality Comparison: NormQuant vs Min-Max ===')
 print(f'Data: {H} heads, {N} tokens, {D} dim')
 print(f'Outlier channels: {outlier_channels} (15x key, 8x value magnitude)')
 print()
@@ -52,16 +52,16 @@ print(f"{'Method':<25} {'K-cos':>8} {'V-cos':>8} {'K-MSE':>10} {'V-MSE':>10} {'C
 print('-' * 75)
 print(f"{'Min-Max 4-bit (current)':<25} {k_cos_mm4:>8.6f} {v_cos_mm4:>8.6f} {k_mse_mm4:>10.6f} {v_mse_mm4:>10.6f} {'3.6x':>6}")
 print(f"{'Min-Max 2-bit':<25} {k_cos_mm2:>8.6f} {v_cos_mm2:>8.6f} {k_mse_mm2:>10.6f} {v_mse_mm2:>10.6f} {'7.3x':>6}")
-print(f"{'TurboQuant 3b-K/2b-V':<25} {metrics['key_cosine']:>8.6f} {metrics['value_cosine']:>8.6f} {metrics['key_mse']:>10.6f} {metrics['value_mse']:>10.6f} {metrics['compression_ratio']:>5.1f}x")
-print(f"{'TurboQuant 4b-K/3b-V':<25} {metrics43['key_cosine']:>8.6f} {metrics43['value_cosine']:>8.6f} {metrics43['key_mse']:>10.6f} {metrics43['value_mse']:>10.6f} {metrics43['compression_ratio']:>5.1f}x")
+print(f"{'NormQuant 3b-K/2b-V':<25} {metrics['key_cosine']:>8.6f} {metrics['value_cosine']:>8.6f} {metrics['key_mse']:>10.6f} {metrics['value_mse']:>10.6f} {metrics['compression_ratio']:>5.1f}x")
+print(f"{'NormQuant 4b-K/3b-V':<25} {metrics43['key_cosine']:>8.6f} {metrics43['value_cosine']:>8.6f} {metrics43['key_mse']:>10.6f} {metrics43['value_mse']:>10.6f} {metrics43['compression_ratio']:>5.1f}x")
 print()
 
 print('=== Key Insight ===')
 print(f"Min-Max 4-bit key cosine:    {k_cos_mm4:.6f} (3.6x compression)")
-print(f"TurboQuant 3b key cosine:    {metrics['key_cosine']:.6f} ({metrics['compression_ratio']:.1f}x compression)")
-print(f"TurboQuant 4b key cosine:    {metrics43['key_cosine']:.6f} ({metrics43['compression_ratio']:.1f}x compression)")
+print(f"NormQuant 3b key cosine:    {metrics['key_cosine']:.6f} ({metrics['compression_ratio']:.1f}x compression)")
+print(f"NormQuant 4b key cosine:    {metrics43['key_cosine']:.6f} ({metrics43['compression_ratio']:.1f}x compression)")
 print()
 if metrics['key_cosine'] > k_cos_mm2:
-    print('TurboQuant 3b keys BEATS min-max 2b keys with better cosine!')
+    print('NormQuant 3b keys BEATS min-max 2b keys with better cosine!')
 if metrics43['key_cosine'] > k_cos_mm4:
-    print('TurboQuant 4b keys BEATS min-max 4b keys -- same bits, better quality!')
+    print('NormQuant 4b keys BEATS min-max 4b keys -- same bits, better quality!')

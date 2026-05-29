@@ -91,7 +91,7 @@ class HFAdaptiveCache:
 class HFProductionCache:
     """HuggingFace-compatible wrapper around ProductionCache.
 
-    Uses the zero-allocation production cache with TurboQuant warm tier
+    Uses the zero-allocation production cache with NormQuant warm tier
     and fused attention. This is the recommended cache for serving.
 
     Usage:

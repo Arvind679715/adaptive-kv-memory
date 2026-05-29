@@ -1,7 +1,9 @@
-"""TurboQuant-style quantization: Hadamard rotation + Lloyd-Max codebook.
+"""NormQuant quantization: Hadamard rotation + per-group normalization + Lloyd-Max codebook.
 
-Implements the core ideas from TurboQuant (ICLR 2026):
+Builds on ideas from TurboQuant (ICLR 2026) but adds per-group normalization
+which is the key enabler for high-quality low-bit KV cache quantization:
 - Random Hadamard rotation smooths outlier channels before quantization
+- Per-group normalization standardizes each group to N(0,1)
 - Lloyd-Max codebook provides optimal non-uniform quantization levels
 - Asymmetric key/value bit allocation (3b keys, 2b values)
 
@@ -18,14 +20,18 @@ import torch.nn.functional as F
 
 
 @dataclass
-class TurboQuantConfig:
-    """Configuration for TurboQuant-style quantization."""
+class NormQuantConfig:
+    """Configuration for NormQuant quantization."""
     key_bits: int = 3          # Bits for key quantization
     value_bits: int = 2        # Bits for value quantization (less sensitive)
     group_size: int = 128      # Quantization group size
     codebook_size: int = 0     # 0 = use 2^bits levels; >0 = custom codebook
     rotation: str = "hadamard" # "hadamard", "random", or "none"
     calibration_steps: int = 50  # Lloyd-Max iterations
+
+
+# Backward-compatible alias
+TurboQuantConfig = NormQuantConfig
 
 
 def hadamard_matrix(n: int, device: torch.device = None) -> torch.Tensor:
@@ -135,13 +141,13 @@ def lloyd_max_codebook(
     return levels.sort()[0], boundaries.sort()[0]
 
 
-class TurboQuantizer:
-    """TurboQuant-style quantizer with rotation + optimal codebook.
+class NormQuantizer:
+    """NormQuant quantizer with rotation + per-group normalization + optimal codebook.
 
     Drop-in replacement for KVQuantizer with better quality at same bits.
 
     Usage:
-        tq = TurboQuantizer(TurboQuantConfig(key_bits=3, value_bits=2))
+        tq = NormQuantizer(NormQuantConfig(key_bits=3, value_bits=2))
         # Calibrate on representative data (once)
         tq.calibrate(sample_keys, sample_values)
         # Quantize
@@ -151,8 +157,8 @@ class TurboQuantizer:
         keys_recon = tq.dequantize_keys(q_keys)
     """
 
-    def __init__(self, config: TurboQuantConfig = None):
-        self.config = config or TurboQuantConfig()
+    def __init__(self, config: NormQuantConfig = None):
+        self.config = config or NormQuantConfig()
         self._key_codebook: Optional[torch.Tensor] = None  # (num_levels,)
         self._key_boundaries: Optional[torch.Tensor] = None
         self._value_codebook: Optional[torch.Tensor] = None
@@ -435,8 +441,8 @@ class TurboQuantizer:
         }
 
 
-class TurboWarmTier:
-    """Warm-tier storage using TurboQuant codebooks.
+class NormQuantWarmTier:
+    """Warm-tier storage using NormQuant codebooks.
 
     Drop-in replacement for the (PackedKVArena K, PackedKVArena V) pair
     used in ProductionLayerCache. Provides the same interface:
@@ -462,7 +468,7 @@ class TurboWarmTier:
         self.head_dim = head_dim
         self.device = device
 
-        self._quantizer = TurboQuantizer(TurboQuantConfig(
+        self._quantizer = NormQuantizer(NormQuantConfig(
             key_bits=key_bits,
             value_bits=value_bits,
             group_size=group_size,
@@ -644,3 +650,8 @@ class TurboWarmTier:
         recon_k = self._quantizer.dequantize_keys(k_qdata)
         recon_v = self._quantizer.dequantize_values(v_qdata)
         return recon_k, recon_v
+
+
+# Backward-compatible aliases
+TurboQuantizer = NormQuantizer
+TurboWarmTier = NormQuantWarmTier

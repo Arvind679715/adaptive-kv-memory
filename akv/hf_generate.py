@@ -88,7 +88,7 @@ class GeneratorConfig:
     # Performance
     use_cache: bool = True
     report_stats_every: int = 50  # Report tier stats every N tokens in streaming
-    use_production_cache: bool = True  # Use ProductionCache with TurboQuant (recommended)
+    use_production_cache: bool = True  # Use ProductionCache with NormQuant (recommended)
 
     def to_cache_config(self) -> CacheConfig:
         return CacheConfig(
@@ -178,7 +178,7 @@ class AdaptiveGenerator:
             logger.info(
                 f"Using ProductionCache: {self._num_layers}L, {self._num_heads}H, "
                 f"d={self._head_dim}, hot={prod_config.hot_budget}, "
-                f"warm={prod_config.warm_budget}@{prod_config.warm_bits}b (TurboQuant)"
+                f"warm={prod_config.warm_budget}@{prod_config.warm_bits}b (NormQuant)"
             )
             return HFProductionCache(prod_config)
         else:
@@ -224,7 +224,7 @@ class AdaptiveGenerator:
 
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
 
-        # Use ProductionCache (TurboQuant + zero-alloc) when enabled and model arch is known
+        # Use ProductionCache (NormQuant + zero-alloc) when enabled and model arch is known
         cache = self._make_cache(cache_config)
 
         t_start = time.perf_counter()

@@ -1,20 +1,26 @@
-"""Adaptive KV Memory — retrieval-preserving hierarchical KV cache compression for LLMs.
+"""AKV — Virtual Memory System for LLM KV Caches.
 
-Quick start:
-    from akv import ProductionCache, ProductionCacheConfig
+Drop-in replacement for any HuggingFace model's KV cache:
 
-    config = ProductionCacheConfig(
-        num_layers=32, num_heads=32, head_dim=128,
-        hot_budget=1024, warm_budget=4096, warm_bits=3,
-    )
-    cache = ProductionCache(config)
+    from akv import AKVCache
+    cache = AKVCache(preset="balanced")
+    outputs = model(**inputs, past_key_values=cache, use_cache=True)
+
+That's it. No model surgery, no custom attention, no monkey-patching.
+
+For model-aware setup:
+    cache = AKVCache.for_model(model, preset="balanced",
+                               protect_first=2, protect_last=2)
 """
 __version__ = "1.0.0"
 
-# --- Core API (what most users need) ---
+# --- Drop-in API (what most users need) ---
+from akv.drop_in import AKVCache, AKVLayer, recommend_preset
+
+# --- Production API (for serving systems) ---
 from akv.production_cache import ProductionCache, ProductionCacheConfig
 from akv.hf_generate import AdaptiveGenerator, GeneratorConfig, adaptive_pipeline
-from akv.turbo_quant import TurboQuantizer, TurboQuantConfig
+from akv.turbo_quant import NormQuantizer, NormQuantConfig, TurboQuantizer, TurboQuantConfig
 
 # --- Research/evaluation API ---
 from akv.quantizer import KVQuantizer, QuantConfig
@@ -44,12 +50,25 @@ from akv.packed_layout import PackedKVArena, PackedKVConfig, PagedKVCache
 from akv.fused_attention import (
     fused_int4_decode_attention, mixed_precision_decode_attention,
 )
+from akv.vmm import (
+    VirtualMemoryCache, VMMConfig,
+    ImportanceBasedMigrator, RetrievalAwarePromoter,
+    AdaptiveBitAllocator, PagedVirtualMemory, FlashAttentionAdapter,
+    MigrationPolicy, PromotionPolicy,
+)
 
 __all__ = [
-    # Core
+    # Drop-in (recommended for most users)
+    "AKVCache", "AKVLayer", "recommend_preset",
+    # Production serving
     "ProductionCache", "ProductionCacheConfig",
     "AdaptiveGenerator", "GeneratorConfig", "adaptive_pipeline",
     "TurboQuantizer", "TurboQuantConfig",
+    # Virtual Memory Manager (VMM)
+    "VirtualMemoryCache", "VMMConfig",
+    "ImportanceBasedMigrator", "RetrievalAwarePromoter",
+    "AdaptiveBitAllocator", "PagedVirtualMemory", "FlashAttentionAdapter",
+    "MigrationPolicy", "PromotionPolicy",
     # Research
     "AdaptiveKVCache", "CacheConfig",
     "KVQuantizer", "QuantConfig",
