@@ -117,7 +117,8 @@ class AKVLayer:
 
         # Importance scores for migration decisions
         self._importance: Optional[torch.Tensor] = None  # (N_hot,)
-        self._decay: float = 0.95
+        self._decay: float = 0.3
+        self._n_anchors: int = 16
         self._step: int = 0
 
         # Quantizer (lazy init)

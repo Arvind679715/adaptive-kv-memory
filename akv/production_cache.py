@@ -59,10 +59,11 @@ class ProductionCacheConfig:
     batch_migration_size: int = 64     # Tokens per migration batch
 
     # Importance scoring
-    importance_decay: float = 0.95
+    importance_decay: float = 0.3
     protect_initial: int = 4
     protect_recent: int = 32
-    scoring_strategy: str = "fifo"  # "hybrid", "fifo", "recency_weighted", etc.
+    n_anchors: int = 16
+    scoring_strategy: str = "importance"  # "importance", "fifo", "hybrid", "recency_weighted"
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

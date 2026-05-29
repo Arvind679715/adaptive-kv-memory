@@ -37,7 +37,9 @@ class CacheConfig:
     eviction_batch_size: int = 64
     initial_tokens_protected: int = 4
     recent_tokens_protected: int = 32
-    importance_decay: float = 0.95
+    importance_decay: float = 0.3
+    n_anchors: int = 16
+    scoring_strategy: str = "importance"  # "importance" or "fifo"
 
 
 class _LayerCache:

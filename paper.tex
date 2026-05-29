@@ -130,18 +130,19 @@ Cold & CPU RAM & INT2 & Unlimited & Predictive prefetch \\
 
 The critical difference from prior work: \textbf{migration decisions are based on token importance, not age}. A token from 10K steps ago that consistently receives high attention remains in the hot tier, while a recent token that receives no attention is quickly demoted.
 
-The importance score for token $i$ at step $t$ is:
-\begin{equation}
-    \text{Importance}_i^{(t)} = \alpha \cdot A_i^{(t)} + \beta \cdot R_i^{(t)} + \gamma \cdot P_i^{(t)}
-\end{equation}
-where:
+The hot tier budget $B$ is split into two regions:
 \begin{itemize}
-    \item $A_i^{(t)} = \lambda A_i^{(t-1)} + a_i^{(t)}$ is the decayed attention accumulation ($\lambda = 0.95$),
-    \item $R_i^{(t)} = (t - t_{\text{last\_access}_i}) / t$ is the normalized recency,
-    \item $P_i^{(t)} = 0.9 \cdot P_i^{(t-1)} + \mathbb{1}[\text{promoted at } t]$ is the retrieval history signal.
+    \item \textbf{Recency window} ($B - n_{\text{anchors}}$ slots): Pure FIFO---most recent tokens always kept.
+    \item \textbf{Importance anchors} ($n_{\text{anchors}}$ slots): Tokens selected by cumulative attention score, regardless of age.
 \end{itemize}
 
-With $\alpha = 0.6$, $\beta = 0.2$, $\gamma = 0.2$. Initial tokens (system prompt) and the most recent 32 tokens are always protected.
+The importance score for token $i$ after chunk $t$ is updated via exponential moving average of last-query-position attention:
+\begin{equation}
+    \text{score}_i^{(t)} = \lambda \cdot \text{score}_i^{(t-1)} + a_{i,\text{last}}^{(t)}
+\end{equation}
+where $a_{i,\text{last}}^{(t)} = \text{mean}_{h}(\text{Attn}[h, q_{\text{last}}, i])$ is the attention from the last query position to token $i$, averaged across heads. We use $\lambda = 0.3$ (fast decay) so anchors must maintain ongoing relevance.
+
+When the hot tier exceeds budget, we demote the lowest-scored tokens from the eligible region (all positions except the protected recency window). The default configuration uses $n_{\text{anchors}} = 16$ with $\text{protect\_recent} = B - 16$, validated to win at both 4-bit (+0.97\%) and 2-bit (+8.08\%) over FIFO (Section~\ref{sec:importance_demotion}).
 
 \subsection{Retrieval-Aware Promotion}
 
@@ -280,11 +281,12 @@ We use the Lloyd-Max algorithm (1D k-means) to find optimal quantization levels 
 \subsection{Setup}
 
 \begin{itemize}
-    \item \textbf{Models}: TinyLlama-1.1B-Chat-v1.0 (22L, 4 KV heads, GQA) and Llama-2-7B (32L, 32 KV heads, MHA)
-    \item \textbf{Datasets}: WikiText-2 (perplexity), synthetic passkey retrieval (recall), factual QA (generation quality)
-    \item \textbf{Hardware}: NVIDIA Tesla T4 16GB (Google Colab)
+    \item \textbf{Models}: TinyLlama-1.1B-Chat-v1.0 (22L, 4 KV heads, GQA), Llama-2-7B (32L, 32 KV heads, MHA), and Qwen2.5-0.5B (24L, 2 KV heads, GQA)
+    \item \textbf{Datasets}: WikiText-2 (perplexity), synthetic passkey retrieval (recall)
+    \item \textbf{Hardware}: NVIDIA Tesla T4 16GB (Kaggle)
     \item \textbf{Metrics}: Perplexity (PPL), retrieval accuracy, decode latency (ms/tok), memory capacity
-    \item \textbf{Baseline methods}: Full cache (FP16), H2O, SnapKV, KIVI 2-bit, AKV min-max
+    \item \textbf{Baseline methods}: Full cache (FP16), H2O, SnapKV, KIVI 2-bit (FIFO demotion)
+    \item \textbf{AKV default config}: Importance-aware demotion with $n_{\text{anchors}}=16$, decay $\lambda=0.3$, last-query-position scoring, min-max symmetric quantization (group\_size=32)
 \end{itemize}
 
 \subsection{Main Results}
@@ -308,7 +310,7 @@ SnapKV (budget=128) & 6.83 & --- & --- & +17.4\% \\
 H2O (budget=128) & 44.22 & --- & --- & +661\% \\
 \bottomrule
 \end{tabular}
-\caption{WikiText-2 perplexity comparison on TinyLlama-1.1B (2048 tokens). NormQuant 3b matches min-max 4b quality at 25\% fewer bits.}
+\caption{WikiText-2 perplexity comparison on TinyLlama-1.1B (2048 tokens). NormQuant 3b matches min-max 4b quality at 25\% fewer bits. AKV rows use FIFO demotion; the full system with importance-aware demotion adds an additional +0.97\% improvement at 4-bit (Table~\ref{tab:importance_vs_fifo}).}
 \label{tab:main_results}
 \end{table}
 
