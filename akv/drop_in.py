@@ -596,6 +596,36 @@ class AKVCache:
         """Convert to tuple-of-tuples format for older transformers."""
         return tuple(self[i] for i in range(len(self.layers)))
 
+    def get_mask_sizes(self, cache_position=None, layer_idx: int = 0):
+        """Return (kv_length, kv_offset) for transformers mask creation.
+
+        Required by transformers >= 4.45 masking_utils.
+        """
+        kv_length = self.get_seq_length(layer_idx)
+        if cache_position is not None and len(cache_position) > 0:
+            last_pos = cache_position[-1].item() if hasattr(cache_position[-1], 'item') else int(cache_position[-1])
+            if last_pos >= kv_length:
+                kv_length = last_pos + 1
+        return kv_length, 0
+
+    @property
+    def key_cache(self):
+        """List of key tensors per layer (transformers compat)."""
+        result = []
+        for i in range(len(self.layers)):
+            k, _ = self[i]
+            result.append(k)
+        return result
+
+    @property
+    def value_cache(self):
+        """List of value tensors per layer (transformers compat)."""
+        result = []
+        for i in range(len(self.layers)):
+            _, v = self[i]
+            result.append(v)
+        return result
+
     def crop(self, max_length: int):
         """Crop cache to max_length (compat)."""
         pass  # Not needed — our budget-based system handles this
