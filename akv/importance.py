@@ -21,6 +21,7 @@ class ScoringStrategy(str, Enum):
     HEAVY_HITTER = "heavy_hitter"
     RECENCY_WEIGHTED = "recency_weighted"
     HYBRID = "hybrid"
+    IMPORTANCE = "importance"  # Last-query-position attention with fast decay + anchors
     FIFO = "fifo"  # Evict oldest unprotected tokens first
 
 
@@ -123,6 +124,11 @@ class ImportanceScorer:
         elif cfg.strategy == ScoringStrategy.FIFO:
             # FIFO: importance = position index (higher = more recent = more important)
             scores[:kv_len] = torch.arange(kv_len, dtype=torch.float32, device=device)
+
+        elif cfg.strategy == ScoringStrategy.IMPORTANCE:
+            # Importance-aware: EMA of last-query-position attention with fast decay
+            # Tokens with high cumulative attention are anchored in the hot tier
+            scores[:kv_len] = scores[:kv_len] * cfg.decay_factor + key_importance
 
         self._scores[layer_idx] = scores
         self._total_seq_len = max(self._total_seq_len, kv_len)
