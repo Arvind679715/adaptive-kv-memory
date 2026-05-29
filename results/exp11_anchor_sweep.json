@@ -1,0 +1,48 @@
+{
+  "experiment": "Importance-Aware vs FIFO Demotion — Anchor Sweep",
+  "model": "Qwen/Qwen2.5-0.5B",
+  "model_config": {
+    "num_layers": 24,
+    "num_kv_heads": 2,
+    "head_dim": 64,
+    "attention": "eager"
+  },
+  "eval_config": {
+    "dataset": "wikitext-2-raw-v1",
+    "window": 2048,
+    "stride": 1024,
+    "num_chunks": 8,
+    "chunk_size": 128,
+    "budget": 256,
+    "group_size": 32,
+    "scoring": "last-query-position attention",
+    "decay": 0.3
+  },
+  "baselines": {
+    "fp16": 12.411,
+    "fifo_4bit": 20.766,
+    "fifo_2bit": 294.697
+  },
+  "importance_4bit": {
+    "n_anchors_4": {"ppl": 20.920, "protect_recent": 252, "vs_fifo": -0.154},
+    "n_anchors_16": {"ppl": 20.564, "protect_recent": 240, "vs_fifo": 0.202},
+    "n_anchors_32": {"ppl": 22.434, "protect_recent": 224, "vs_fifo": -1.668}
+  },
+  "importance_2bit": {
+    "n_anchors_4": {"ppl": 285.877, "protect_recent": 252, "vs_fifo": 8.820},
+    "n_anchors_16": {"ppl": 270.896, "protect_recent": 240, "vs_fifo": 23.800},
+    "n_anchors_32": {"ppl": 267.508, "protect_recent": 224, "vs_fifo": 27.189}
+  },
+  "best_configs": {
+    "4bit": {"n_anchors": 16, "gap": 0.202, "relative_pct": 0.97},
+    "2bit": {"n_anchors": 32, "gap": 27.189, "relative_pct": 9.23}
+  },
+  "dual_win": {
+    "n_anchors": 16,
+    "4bit_gap": 0.202,
+    "2bit_gap": 23.800
+  },
+  "headline": "At n_anchors=16, importance-aware demotion beats FIFO at BOTH 4-bit (+0.97%) and 2-bit (+8.08%)",
+  "commit": "728d664",
+  "date": "2026-05-29"
+}

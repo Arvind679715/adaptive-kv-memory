@@ -91,6 +91,27 @@ Our solution:
 
 ## Benchmarks
 
+### Importance-Aware vs FIFO Demotion (Novel Contribution)
+
+**The key innovation over KIVI-2:** AKV uses attention-derived importance scores to decide *which* tokens stay at full precision, rather than blindly keeping the most recent N (FIFO).
+
+**Model:** Qwen2.5-0.5B | **Dataset:** WikiText-2 | **Budget:** 256 fp16 tokens | **Scoring:** last-query-position attention, decay=0.3
+
+| n_anchors | protect_recent | 4-bit PPL | vs FIFO-4b | 2-bit PPL | vs FIFO-2b |
+|-----------|---------------|-----------|------------|-----------|------------|
+| FIFO      | 256           | 20.766    | —          | 294.697   | —          |
+| 4         | 252           | 20.920    | −0.154     | 285.877   | **+8.820** |
+| **16**    | **240**       | **20.564**| **+0.202** | **270.896**| **+23.800** |
+| 32        | 224           | 22.434    | −1.668     | 267.508   | **+27.189** |
+
+**Key finding:** At `n_anchors=16`, importance-aware demotion beats FIFO at **both** bit-widths simultaneously:
+- **4-bit:** +0.97% improvement (20.564 vs 20.766)
+- **2-bit:** +8.08% improvement (270.896 vs 294.697)
+
+The benefit scales with quantization aggressiveness — when compression noise is severe (2-bit), protecting attention sinks from quantization is critical. FP16 baseline: 12.411.
+
+---
+
 ### VRAM Savings
 
 | Context | Full Cache | AKV-4bit | AKV-2bit | Savings |
