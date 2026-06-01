@@ -8,6 +8,7 @@ version = "1.0.0"
 description = "Retrieval-preserving hierarchical KV cache compression for long-context LLM inference"
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
     {name = "Arvind S.", email = "arvinds@ups.com"}
