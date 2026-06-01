@@ -36,7 +36,7 @@ from typing import Optional, Callable
 
 import torch
 
-from akv.quantizer import KVQuantizer, QuantConfig, QuantizedTensor
+from akv.turbo_quant import NormQuantizer, NormQuantConfig
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +56,8 @@ class MigrationTask:
     token_indices: torch.Tensor
     keys: Optional[torch.Tensor] = None
     values: Optional[torch.Tensor] = None
-    quantized_keys: Optional[QuantizedTensor] = None
-    quantized_values: Optional[QuantizedTensor] = None
+    quantized_keys: Optional[dict] = None
+    quantized_values: Optional[dict] = None
     callback: Optional[Callable] = None
     priority: int = 0  # Higher = more urgent
 
@@ -137,13 +137,15 @@ class AsyncMigrator:
         self._pending_tasks: deque[MigrationTask] = deque()
         self._completed_events: list[torch.cuda.Event] = []
 
-        # Quantizers
-        self._warm_quantizer = KVQuantizer(QuantConfig(
-            bits=self.config.warm_bits,
+        # Quantizers (NormQuant: Hadamard + per-group norm + Lloyd-Max)
+        self._warm_quantizer = NormQuantizer(NormQuantConfig(
+            key_bits=self.config.warm_bits,
+            value_bits=self.config.warm_bits,
             group_size=self.config.group_size,
         ))
-        self._cold_quantizer = KVQuantizer(QuantConfig(
-            bits=self.config.cold_bits,
+        self._cold_quantizer = NormQuantizer(NormQuantConfig(
+            key_bits=self.config.cold_bits,
+            value_bits=self.config.cold_bits,
             group_size=self.config.group_size,
         ))
 
@@ -208,8 +210,8 @@ class AsyncMigrator:
         self,
         layer_idx: int,
         token_indices: torch.Tensor,
-        quantized_keys: QuantizedTensor,
-        quantized_values: QuantizedTensor,
+        quantized_keys: dict,
+        quantized_values: dict,
         source_tier: str = "cold",
         callback: Optional[Callable] = None,
     ) -> None:
@@ -287,9 +289,9 @@ class AsyncMigrator:
             task.callback(task)
 
     def _do_hot_to_warm(self, task: MigrationTask) -> None:
-        """Quantize tokens from FP16 to INT4 (hot → warm)."""
-        q_keys = self._warm_quantizer.quantize(task.keys)
-        q_values = self._warm_quantizer.quantize(task.values)
+        """Quantize tokens from FP16 to NormQuant (hot → warm)."""
+        q_keys = self._warm_quantizer.quantize_keys(task.keys)
+        q_values = self._warm_quantizer.quantize_values(task.values)
 
         task.quantized_keys = q_keys
         task.quantized_values = q_values
@@ -304,23 +306,23 @@ class AsyncMigrator:
             # Re-quantize to lower precision if needed
             if self.config.cold_bits < self.config.warm_bits:
                 # Dequantize warm, then requantize to cold precision
-                keys_fp = self._warm_quantizer.dequantize(task.quantized_keys)
-                values_fp = self._warm_quantizer.dequantize(task.quantized_values)
-                task.quantized_keys = self._cold_quantizer.quantize(keys_fp)
-                task.quantized_values = self._cold_quantizer.quantize(values_fp)
+                keys_fp = self._warm_quantizer.dequantize_keys(task.quantized_keys)
+                values_fp = self._warm_quantizer.dequantize_values(task.quantized_values)
+                task.quantized_keys = self._cold_quantizer.quantize_keys(keys_fp)
+                task.quantized_values = self._cold_quantizer.quantize_values(values_fp)
 
             # Transfer to CPU
             if self._transfer_stream:
                 with torch.cuda.stream(self._transfer_stream):
-                    task.quantized_keys = task.quantized_keys.to_device(
-                        "cpu", non_blocking=self.config.non_blocking
+                    task.quantized_keys = self._move_qdata_to_device(
+                        task.quantized_keys, "cpu"
                     )
-                    task.quantized_values = task.quantized_values.to_device(
-                        "cpu", non_blocking=self.config.non_blocking
+                    task.quantized_values = self._move_qdata_to_device(
+                        task.quantized_values, "cpu"
                     )
             else:
-                task.quantized_keys = task.quantized_keys.to_device("cpu")
-                task.quantized_values = task.quantized_values.to_device("cpu")
+                task.quantized_keys = self._move_qdata_to_device(task.quantized_keys, "cpu")
+                task.quantized_values = self._move_qdata_to_device(task.quantized_values, "cpu")
 
         self.stats.warm_to_cold_count += 1
         self.stats.total_demotions += 1
@@ -331,26 +333,26 @@ class AsyncMigrator:
         if task.quantized_keys is not None:
             if self._transfer_stream:
                 with torch.cuda.stream(self._transfer_stream):
-                    task.quantized_keys = task.quantized_keys.to_device(
-                        self.device, non_blocking=self.config.non_blocking
+                    task.quantized_keys = self._move_qdata_to_device(
+                        task.quantized_keys, self.device
                     )
-                    task.quantized_values = task.quantized_values.to_device(
-                        self.device, non_blocking=self.config.non_blocking
+                    task.quantized_values = self._move_qdata_to_device(
+                        task.quantized_values, self.device
                     )
                 self._transfer_stream.synchronize()
             else:
-                task.quantized_keys = task.quantized_keys.to_device(self.device)
-                task.quantized_values = task.quantized_values.to_device(self.device)
+                task.quantized_keys = self._move_qdata_to_device(task.quantized_keys, self.device)
+                task.quantized_values = self._move_qdata_to_device(task.quantized_values, self.device)
 
         self.stats.cold_to_warm_count += 1
         self.stats.total_promotions += 1
         self.stats.total_tokens_migrated += task.token_indices.shape[0]
 
     def _do_warm_to_hot(self, task: MigrationTask) -> None:
-        """Dequantize tokens from INT4 back to FP16 (warm → hot)."""
+        """Dequantize tokens from NormQuant back to FP16 (warm → hot)."""
         if task.quantized_keys is not None:
-            task.keys = self._warm_quantizer.dequantize(task.quantized_keys)
-            task.values = self._warm_quantizer.dequantize(task.quantized_values)
+            task.keys = self._warm_quantizer.dequantize_keys(task.quantized_keys)
+            task.values = self._warm_quantizer.dequantize_values(task.quantized_values)
 
         self.stats.warm_to_hot_count += 1
         self.stats.total_promotions += 1
@@ -392,6 +394,16 @@ class AsyncMigrator:
 
         if has_promotions:
             self._flush_pending()
+
+    def _move_qdata_to_device(self, qdata: dict, device: str) -> dict:
+        """Move quantized data dict tensors to a target device."""
+        moved = {}
+        for k, v in qdata.items():
+            if isinstance(v, torch.Tensor):
+                moved[k] = v.to(device, non_blocking=self.config.non_blocking)
+            else:
+                moved[k] = v
+        return moved
 
     def get_stats(self) -> dict:
         """Get migration statistics."""

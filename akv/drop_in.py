@@ -29,24 +29,36 @@ logger = logging.getLogger(__name__)
 
 # Lazy import to avoid hard dependency on specific transformers version
 _DynamicCache = None
+_BaseCache = None
 
 
 def _get_dynamic_cache_base():
-    global _DynamicCache
+    global _DynamicCache, _BaseCache
     if _DynamicCache is None:
         try:
             from transformers.cache_utils import DynamicCache
             _DynamicCache = DynamicCache
         except ImportError:
-            # Fallback: define a minimal base that works without transformers
-            class _FallbackCache:
-                def __init__(self):
-                    self.layers = []
-                def get_seq_length(self, layer_idx=0):
-                    return 0
-                def __len__(self):
-                    return len(self.layers)
-            _DynamicCache = _FallbackCache
+            try:
+                from transformers import Cache
+                _DynamicCache = Cache
+            except ImportError:
+                # Fallback: define a minimal base that works without transformers
+                class _FallbackCache:
+                    def __init__(self):
+                        self.layers = []
+                    def get_seq_length(self, layer_idx=0):
+                        return 0
+                    def __len__(self):
+                        return len(self.layers)
+                _DynamicCache = _FallbackCache
+    # Also resolve _BaseCache for isinstance checks
+    if _BaseCache is None:
+        try:
+            from transformers import Cache
+            _BaseCache = Cache
+        except ImportError:
+            _BaseCache = _DynamicCache
     return _DynamicCache
 
 
@@ -123,7 +135,6 @@ class AKVLayer:
 
         # Quantizer (lazy init)
         self._quantizer = None
-        self._calibrated = False
 
     def _ensure_quantizer(self, head_dim: int, device):
         """Lazy-init NormQuant quantizer on first use."""
@@ -282,13 +293,8 @@ class AKVLayer:
             demote_k = self._hot_keys[:, :, demote_idx, :]
             demote_v = self._hot_values[:, :, demote_idx, :]
 
-            # Actually quantize with NormQuant (not just store fp16)
+            # Actually quantize with NormQuant (no calibration needed)
             if self._quantizer is not None:
-                # Calibrate on first batch
-                if not self._calibrated:
-                    self._quantizer.calibrate(
-                        demote_k.squeeze(0), demote_v.squeeze(0))
-                    self._calibrated = True
                 # Quantize → dequantize (lossy compression)
                 qk = self._quantizer.quantize_keys(demote_k.squeeze(0))
                 qv = self._quantizer.quantize_values(demote_v.squeeze(0))
@@ -375,11 +381,11 @@ class AKVLayer:
 # AKVCache — the main drop-in class
 # =============================================================================
 
-class AKVCache:
+class AKVCache(_get_dynamic_cache_base()):
     """Drop-in KV cache with virtual memory management.
 
-    Subclasses or mimics `transformers.DynamicCache` so it works with
-    any HuggingFace model via `past_key_values=`.
+    Subclasses `transformers.DynamicCache` so it passes isinstance checks
+    and works with any HuggingFace model via `past_key_values=`.
 
     Usage:
         # Simple (recommended):
@@ -470,6 +476,14 @@ class AKVCache:
         self.layers: list[AKVLayer] = []
         self._seen_tokens: int = 0
 
+        # Initialize base class (DynamicCache or Cache)
+        base = _get_dynamic_cache_base()
+        if base is not object and hasattr(base, '__init__'):
+            try:
+                super().__init__()
+            except TypeError:
+                pass  # Fallback base doesn't need init args
+
     @classmethod
     def for_model(cls, model, **kwargs) -> "AKVCache":
         """Build cache with architecture info read from model.config.
@@ -548,7 +562,7 @@ class AKVCache:
 
     @seen_tokens.setter
     def seen_tokens(self, value: int):
-        pass  # Accept writes silently (compat shim)
+        self._seen_tokens = value
 
     def reorder_cache(self, beam_idx: torch.LongTensor):
         """Reorder for beam search."""
@@ -628,8 +642,45 @@ class AKVCache:
         return result
 
     def crop(self, max_length: int):
-        """Crop cache to max_length (compat)."""
-        pass  # Not needed — our budget-based system handles this
+        """Crop cache to max_length (speculative decoding compat)."""
+        for layer in self.layers:
+            if layer._hot_keys is not None:
+                cur_len = layer._hot_keys.shape[2]
+                if layer._warm_keys_fp16 is not None:
+                    cur_len += layer._warm_keys_fp16.shape[2]
+                if cur_len > max_length:
+                    # Trim hot tier from the end
+                    keep = max(0, layer._hot_keys.shape[2] - (cur_len - max_length))
+                    layer._hot_keys = layer._hot_keys[:, :, :keep, :]
+                    layer._hot_values = layer._hot_values[:, :, :keep, :]
+                    layer._total_len = max_length
+
+    def batch_repeat_interleave(self, repeats: int):
+        """Repeat cache for beam expansion (transformers 4.43+ beam search)."""
+        for layer in self.layers:
+            if layer._hot_keys is not None:
+                layer._hot_keys = layer._hot_keys.repeat_interleave(repeats, dim=0)
+                layer._hot_values = layer._hot_values.repeat_interleave(repeats, dim=0)
+            if layer._warm_keys_fp16 is not None:
+                layer._warm_keys_fp16 = layer._warm_keys_fp16.repeat_interleave(repeats, dim=0)
+                layer._warm_values_fp16 = layer._warm_values_fp16.repeat_interleave(repeats, dim=0)
+        return self
+
+    def batch_select_indices(self, indices: torch.LongTensor):
+        """Select specific batch indices (transformers 4.43+ beam search)."""
+        for layer in self.layers:
+            if layer._hot_keys is not None:
+                layer._hot_keys = layer._hot_keys.index_select(0, indices)
+                layer._hot_values = layer._hot_values.index_select(0, indices)
+            if layer._warm_keys_fp16 is not None:
+                layer._warm_keys_fp16 = layer._warm_keys_fp16.index_select(0, indices)
+                layer._warm_values_fp16 = layer._warm_values_fp16.index_select(0, indices)
+        return self
+
+    def reset(self):
+        """Reset cache to empty state (speculative decoding rewind)."""
+        self.layers.clear()
+        self._seen_tokens = 0
 
     @classmethod
     def from_legacy_cache(cls, past_key_values=None):

@@ -21,6 +21,7 @@ from akv.drop_in import AKVCache, AKVLayer, recommend_preset
 from akv.production_cache import ProductionCache, ProductionCacheConfig
 from akv.hf_generate import AdaptiveGenerator, GeneratorConfig, adaptive_pipeline
 from akv.turbo_quant import NormQuantizer, NormQuantConfig, TurboQuantizer, TurboQuantConfig
+from akv.diagnostics import recommend_preset as diagnose_preset, diagnose_model, DiagnosticReport
 
 # --- Research/evaluation API ---
 from akv.quantizer import KVQuantizer, QuantConfig
@@ -64,6 +65,7 @@ __all__ = [
     "ProductionCache", "ProductionCacheConfig",
     "AdaptiveGenerator", "GeneratorConfig", "adaptive_pipeline",
     "TurboQuantizer", "TurboQuantConfig",
+    "diagnose_model", "diagnose_preset", "DiagnosticReport",
     # Virtual Memory Manager (VMM)
     "VirtualMemoryCache", "VMMConfig",
     "ImportanceBasedMigrator", "RetrievalAwarePromoter",

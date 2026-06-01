@@ -3,11 +3,11 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "adaptive-kv-memory"
+name = "akv"
 version = "1.0.0"
 description = "Retrieval-preserving hierarchical KV cache compression for long-context LLM inference"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
     {name = "Arvind S.", email = "arvinds@ups.com"}
@@ -53,7 +53,7 @@ vllm = [
     "vllm>=0.4.0",
 ]
 all = [
-    "adaptive-kv-memory[dev,bench,triton,vllm]",
+    "akv[dev,bench,triton,vllm]",
 ]
 
 [project.urls]
@@ -64,6 +64,7 @@ Documentation = "https://github.com/arvind-s/adaptive-kv-memory/tree/main/docs"
 
 [project.scripts]
 akv = "akv.cli:main"
+akv-server = "akv.server:main"
 
 [tool.setuptools.packages.find]
 include = ["akv*"]

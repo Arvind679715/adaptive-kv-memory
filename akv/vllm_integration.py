@@ -37,8 +37,7 @@ from typing import Optional, TYPE_CHECKING
 
 import torch
 
-from akv.cache import AdaptiveKVCache, CacheConfig
-from akv.quantizer import KVQuantizer, QuantConfig
+from akv.production_cache import ProductionCache, ProductionCacheConfig
 
 if TYPE_CHECKING:
     pass
@@ -74,19 +73,25 @@ class AdaptiveVLLMConfig:
     migration_stream: bool = True  # Use separate CUDA stream for migrations
     prefetch_cold_tokens: int = 16  # Prefetch from cold when near warm boundary
 
-    def to_cache_config(self) -> CacheConfig:
-        return CacheConfig(
+    def to_production_config(
+        self, num_layers: int, num_heads: int, head_dim: int
+    ) -> ProductionCacheConfig:
+        return ProductionCacheConfig(
+            num_layers=num_layers,
+            num_heads=num_heads,
+            head_dim=head_dim,
             hot_budget=self.hot_budget_per_seq,
             warm_budget=self.warm_budget_per_seq,
             warm_bits=self.warm_bits,
             cold_bits=self.cold_bits,
             group_size=self.group_size,
-            enable_cold_tier=self.enable_cold_tier,
-            eviction_trigger_ratio=self.eviction_trigger_ratio,
-            eviction_batch_size=self.eviction_batch_size,
-            initial_tokens_protected=self.initial_tokens_protected,
-            recent_tokens_protected=self.recent_tokens_protected,
+            warm_quantizer="turbo",
+            use_async_migration=self.enable_async_migration,
+            migration_threshold=self.eviction_trigger_ratio,
+            batch_migration_size=self.eviction_batch_size,
             importance_decay=self.importance_decay,
+            protect_initial=self.initial_tokens_protected,
+            protect_recent=self.recent_tokens_protected,
         )
 
 
@@ -120,7 +125,7 @@ class AdaptiveCacheEngine:
         self.device = device
 
         # Per-sequence caches, keyed by sequence ID
-        self._seq_caches: dict[int, AdaptiveKVCache] = {}
+        self._seq_caches: dict[int, ProductionCache] = {}
 
         # CUDA stream for async migrations (if enabled)
         self._migration_stream = None
@@ -144,8 +149,14 @@ class AdaptiveCacheEngine:
             self._seq_caches[seq_id].reset()
             return
 
-        cache_config = self.config.to_cache_config()
-        self._seq_caches[seq_id] = AdaptiveKVCache(cache_config)
+        prod_config = self.config.to_production_config(
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+        )
+        prod_config.device = self.device
+        prod_config.dtype = self.dtype
+        self._seq_caches[seq_id] = ProductionCache(prod_config)
         self._active_sequences += 1
         self._total_sequences += 1
 
@@ -155,7 +166,7 @@ class AdaptiveCacheEngine:
             del self._seq_caches[seq_id]
             self._active_sequences -= 1
 
-    def get_cache(self, seq_id: int) -> Optional[AdaptiveKVCache]:
+    def get_cache(self, seq_id: int) -> Optional[ProductionCache]:
         """Get the cache for a sequence."""
         return self._seq_caches.get(seq_id)
 
@@ -191,21 +202,19 @@ class AdaptiveCacheEngine:
         seq_id: int,
         layer_idx: int,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Get full K, V for a layer (for standard attention computation).
+        """Get full K, V for a layer (assembled hot + warm).
 
-        For sequences using the adaptive cache, this returns the hot-tier
-        KV pairs directly. The warm tier should be handled via our fused
-        mixed-precision attention kernel for best performance.
+        Uses ProductionCache.get_kv() which returns cached warm fp16
+        concatenated with hot tier — no redundant dequantization.
         """
         cache = self._seq_caches.get(seq_id)
         if cache is None:
             return None, None
 
-        layer = cache._layers[layer_idx] if layer_idx < len(cache._layers) else None
-        if layer is None:
+        if layer_idx >= len(cache._layers):
             return None, None
 
-        return layer.hot_keys, layer.hot_values
+        return cache.get_kv(layer_idx)
 
     def swap_in(self, seq_id: int, src_device: str = "cpu") -> None:
         """Swap a sequence's cache from CPU to GPU (for preemption recovery)."""
@@ -233,14 +242,12 @@ class AdaptiveCacheEngine:
         else:
             self._move_cache_to_device(cache, "cpu")
 
-    def _move_cache_to_device(self, cache: AdaptiveKVCache, device: str) -> None:
+    def _move_cache_to_device(self, cache: ProductionCache, device: str) -> None:
         """Move all hot-tier tensors to target device."""
         for layer in cache._layers:
-            if layer.hot_keys is not None:
-                layer.hot_keys = layer.hot_keys.to(device, non_blocking=True)
-                layer.hot_values = layer.hot_values.to(device, non_blocking=True)
-            if layer.hot_positions is not None:
-                layer.hot_positions = layer.hot_positions.to(device, non_blocking=True)
+            layer._hot_k_contig = layer._hot_k_contig.to(device, non_blocking=True)
+            layer._hot_v_contig = layer._hot_v_contig.to(device, non_blocking=True)
+            # Warm tier stays on original device (already quantized/compact)
 
     def memory_usage(self) -> dict:
         """Get aggregate memory usage across all active sequences."""
@@ -303,6 +310,9 @@ class AdaptiveAttentionBackend:
     ) -> torch.Tensor:
         """Run attention with mixed-precision KV cache.
 
+        Uses ProductionCache.fused_attention() when available (TurboWarmTier),
+        falls back to get_kv() + standard attention.
+
         Args:
             query: (B, H, M, D) query tensor
             seq_id: Sequence identifier
@@ -312,43 +322,25 @@ class AdaptiveAttentionBackend:
         Returns:
             (B, H, M, D) attention output
         """
-        from akv.triton_ops import fused_mixed_precision_attention
-
         cache = self.cache_engine.get_cache(seq_id)
         if cache is None:
             raise ValueError(f"No cache for seq_id={seq_id}")
 
-        layer = cache._layers[layer_idx]
+        # Try fused attention path (hot fp16 + warm quantized in one kernel)
+        if self._use_triton:
+            try:
+                return cache.fused_attention(query, layer_idx, sm_scale=sm_scale)
+            except (NotImplementedError, AttributeError):
+                pass
 
-        # Get hot tier (fp16)
-        key_hot = layer.hot_keys
-        value_hot = layer.hot_values
-
-        # Get warm tier (quantized)
-        if layer.warm_keys is not None:
-            output, attn_weights = fused_mixed_precision_attention(
-                query=query,
-                key_hot=key_hot,
-                value_hot=value_hot,
-                key_warm_packed=layer.warm_keys.data,
-                key_warm_scales=layer.warm_keys.scales,
-                key_warm_zeros=layer.warm_keys.zeros,
-                value_warm_packed=layer.warm_values.data,
-                value_warm_scales=layer.warm_values.scales,
-                value_warm_zeros=layer.warm_values.zeros,
-                bits=cache.config.warm_bits,
-                group_size=cache.config.group_size,
-                sm_scale=sm_scale,
-            )
-            return output
-        else:
-            # Only hot tier — standard attention
-            import math
-            if sm_scale is None:
-                sm_scale = 1.0 / math.sqrt(query.shape[-1])
-            attn = torch.matmul(query, key_hot.transpose(-2, -1)) * sm_scale
-            attn = torch.softmax(attn, dim=-1)
-            return torch.matmul(attn, value_hot)
+        # Fallback: assemble full KV and do standard attention
+        import math
+        keys, values = cache.get_kv(layer_idx)
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(query.shape[-1])
+        attn = torch.matmul(query, keys.transpose(-2, -1)) * sm_scale
+        attn = torch.softmax(attn, dim=-1)
+        return torch.matmul(attn, values)
 
 
 class AdaptiveKVLLM:
