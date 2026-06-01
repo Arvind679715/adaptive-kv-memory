@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "akv"
+name = "akv-cache"
 version = "1.0.0"
 description = "Retrieval-preserving hierarchical KV cache compression for long-context LLM inference"
 readme = "README.md"
@@ -54,7 +54,7 @@ vllm = [
     "vllm>=0.4.0",
 ]
 all = [
-    "akv[dev,bench,triton,vllm]",
+    "akv-cache[dev,bench,triton,vllm]",
 ]
 
 [project.urls]
