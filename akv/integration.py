@@ -6,7 +6,7 @@ and a monkey-patch function to inject it into any HF model.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, Any
 
 import torch
 
@@ -15,8 +15,111 @@ from akv.production_cache import ProductionCache, ProductionCacheConfig
 
 logger = logging.getLogger(__name__)
 
+# Detect transformers cache architecture version
+_BaseCache = object
+_CacheLayerMixin = None
+_CACHE_VERSION = 0  # 0=no transformers, 1=old Cache, 2=new Cache with CacheLayerMixin
 
-class HFAdaptiveCache:
+try:
+    from transformers.cache_utils import CacheLayerMixin as _CacheLayerMixin
+    from transformers import Cache as _BaseCache
+    _CACHE_VERSION = 2
+except ImportError:
+    try:
+        from transformers import Cache as _BaseCache
+        _CACHE_VERSION = 1
+    except ImportError:
+        pass
+
+
+# --- Layer wrappers for transformers 5.8+ (CacheLayerMixin) ---
+
+if _CacheLayerMixin is not None:
+    from abc import ABC
+
+    class _AdaptiveCacheLayer(_CacheLayerMixin):
+        """Per-layer cache that delegates to parent HFAdaptiveCache."""
+
+        def __init__(self):
+            super().__init__()
+            self._parent: Optional[HFAdaptiveCache] = None
+            self._layer_idx: int = 0
+
+        def _bind(self, parent: "HFAdaptiveCache", layer_idx: int):
+            self._parent = parent
+            self._layer_idx = layer_idx
+
+        def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+            self.is_initialized = True
+
+        def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+            cache_kwargs = kwargs if kwargs else {}
+            attention_weights = cache_kwargs.get("attention_weights")
+            keys, values = self._parent._cache.update(
+                key_states, value_states, self._layer_idx,
+                attention_weights=attention_weights,
+            )
+            if self._layer_idx == 0:
+                self._parent.seen_tokens += key_states.shape[2]
+            return keys, values
+
+        def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+            seq_len = self.get_seq_length()
+            return (seq_len, seq_len + query_length)
+
+        def get_seq_length(self) -> int:
+            if self._parent is None:
+                return 0
+            return self._parent._cache.get_seq_length(self._layer_idx)
+
+        def get_max_cache_shape(self) -> int:
+            if self._parent is None:
+                return 0
+            return self._parent._cache.get_max_cache_shape() or 0
+
+    class _ProductionCacheLayer(_CacheLayerMixin):
+        """Per-layer cache that delegates to parent HFProductionCache."""
+
+        def __init__(self):
+            super().__init__()
+            self._parent: Optional[HFProductionCache] = None
+            self._layer_idx: int = 0
+
+        def _bind(self, parent: "HFProductionCache", layer_idx: int):
+            self._parent = parent
+            self._layer_idx = layer_idx
+
+        def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+            self.is_initialized = True
+
+        def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+            cache_kwargs = kwargs if kwargs else {}
+            attention_weights = cache_kwargs.get("attention_weights")
+            keys, values = self._parent._cache.update(
+                key_states, value_states, self._layer_idx,
+                attention_weights=attention_weights,
+            )
+            if self._layer_idx == 0:
+                self._parent.seen_tokens += key_states.shape[-2]
+            return keys, values
+
+        def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+            seq_len = self.get_seq_length()
+            return (seq_len, seq_len + query_length)
+
+        def get_seq_length(self) -> int:
+            if self._parent is None:
+                return 0
+            return self._parent._cache.get_seq_length(self._layer_idx)
+
+        def get_max_cache_shape(self) -> int:
+            if self._parent is None:
+                return 0
+            cfg = self._parent._cache.config
+            return cfg.hot_budget + cfg.warm_budget
+
+
+class HFAdaptiveCache(_BaseCache if _CACHE_VERSION > 0 else object):
     """HuggingFace-compatible wrapper around AdaptiveKVCache.
 
     Implements the interface expected by transformers models:
@@ -30,6 +133,22 @@ class HFAdaptiveCache:
         self._cache = AdaptiveKVCache(config)
         self.seen_tokens = 0
 
+        if _CACHE_VERSION == 2:
+            # Transformers 5.8+: create layer objects and call Cache.__init__
+            num_layers = getattr(config, 'num_layers', 32) if config else 32
+            layer_objs = []
+            for i in range(num_layers):
+                layer = _AdaptiveCacheLayer()
+                layer._bind(self, i)
+                layer_objs.append(layer)
+            super().__init__(layers=layer_objs)
+        elif _CACHE_VERSION == 1:
+            # Older transformers: simple Cache.__init__ (no args required)
+            try:
+                super().__init__()
+            except TypeError:
+                pass
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -38,17 +157,18 @@ class HFAdaptiveCache:
         cache_kwargs: Optional[dict] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Update cache with new KV states. Compatible with DynamicCache.update()."""
+        if _CACHE_VERSION == 2:
+            # Delegate to parent Cache.update() which calls layer.update()
+            return super().update(key_states, value_states, layer_idx, **(cache_kwargs or {}))
+
         cache_kwargs = cache_kwargs or {}
         attention_weights = cache_kwargs.get("attention_weights")
-
         keys, values = self._cache.update(
             key_states, value_states, layer_idx,
             attention_weights=attention_weights,
         )
-
         if layer_idx == 0:
             self.seen_tokens += key_states.shape[2]
-
         return keys, values
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
@@ -56,6 +176,12 @@ class HFAdaptiveCache:
 
     def get_max_cache_shape(self) -> Optional[int]:
         return self._cache.get_max_cache_shape()
+
+    def get_usable_length(self, new_seq_length: int = 0, layer_idx: int = 0) -> int:
+        return self.get_seq_length(layer_idx)
+
+    def get_mask_sizes(self, *args, **kwargs) -> Any:
+        return None
 
     def __len__(self) -> int:
         return len(self._cache)
@@ -67,7 +193,6 @@ class HFAdaptiveCache:
         return iter(self._cache)
 
     def reorder_cache(self, beam_idx: torch.LongTensor):
-        """Reorder cache for beam search. Applies to hot tier only."""
         for layer in self._cache._layers:
             if layer.hot_keys is not None:
                 layer.hot_keys = layer.hot_keys.index_select(0, beam_idx.to(layer.hot_keys.device))
@@ -88,7 +213,7 @@ class HFAdaptiveCache:
         self.seen_tokens = 0
 
 
-class HFProductionCache:
+class HFProductionCache(_BaseCache if _CACHE_VERSION > 0 else object):
     """HuggingFace-compatible wrapper around ProductionCache.
 
     Uses the zero-allocation production cache with NormQuant warm tier
@@ -110,6 +235,21 @@ class HFProductionCache:
         self._cache = ProductionCache(config)
         self.seen_tokens = 0
 
+        if _CACHE_VERSION == 2:
+            # Transformers 5.8+: create layer objects
+            num_layers = config.num_layers if config else 32
+            layer_objs = []
+            for i in range(num_layers):
+                layer = _ProductionCacheLayer()
+                layer._bind(self, i)
+                layer_objs.append(layer)
+            super().__init__(layers=layer_objs)
+        elif _CACHE_VERSION == 1:
+            try:
+                super().__init__()
+            except TypeError:
+                pass
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -118,17 +258,17 @@ class HFProductionCache:
         cache_kwargs: Optional[dict] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Update cache with new KV states. Compatible with DynamicCache.update()."""
+        if _CACHE_VERSION == 2:
+            return super().update(key_states, value_states, layer_idx, **(cache_kwargs or {}))
+
         cache_kwargs = cache_kwargs or {}
         attention_weights = cache_kwargs.get("attention_weights")
-
         keys, values = self._cache.update(
             key_states, value_states, layer_idx,
             attention_weights=attention_weights,
         )
-
         if layer_idx == 0:
             self.seen_tokens += key_states.shape[-2]
-
         return keys, values
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
@@ -137,6 +277,12 @@ class HFProductionCache:
     def get_max_cache_shape(self) -> Optional[int]:
         cfg = self._cache.config
         return cfg.hot_budget + cfg.warm_budget
+
+    def get_usable_length(self, new_seq_length: int = 0, layer_idx: int = 0) -> int:
+        return self.get_seq_length(layer_idx)
+
+    def get_mask_sizes(self, *args, **kwargs) -> Any:
+        return None
 
     def __len__(self) -> int:
         return len(self._cache)
@@ -149,7 +295,6 @@ class HFProductionCache:
             yield self._cache[i]
 
     def reorder_cache(self, beam_idx: torch.LongTensor):
-        """Reorder cache for beam search (not supported in production mode)."""
         raise NotImplementedError("ProductionCache does not support beam search reordering")
 
     @property
@@ -169,7 +314,6 @@ class HFProductionCache:
         }
 
     def fused_attention(self, query: torch.Tensor, layer_idx: int) -> torch.Tensor:
-        """Run fused mixed-precision attention (fast path for decode)."""
         return self._cache.fused_attention(query, layer_idx)
 
     def reset(self):
