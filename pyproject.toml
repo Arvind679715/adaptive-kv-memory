@@ -58,10 +58,10 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/arvind-s/adaptive-kv-memory"
-Repository = "https://github.com/arvind-s/adaptive-kv-memory"
-Issues = "https://github.com/arvind-s/adaptive-kv-memory/issues"
-Documentation = "https://github.com/arvind-s/adaptive-kv-memory/tree/main/docs"
+Homepage = "https://github.com/Arvind679715/adaptive-kv-memory"
+Repository = "https://github.com/Arvind679715/adaptive-kv-memory"
+Issues = "https://github.com/Arvind679715/adaptive-kv-memory/issues"
+Documentation = "https://github.com/Arvind679715/adaptive-kv-memory/tree/main/docs"
 
 [project.scripts]
 akv = "akv.cli:main"
