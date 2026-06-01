@@ -10,7 +10,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
 
-**[Technical Blog](docs/technical_blog.md) • [Architecture](docs/architecture.md) • [Benchmarks](#benchmarks) • [Getting Started](#quickstart)**
+**[Technical Blog](https://github.com/Arvind679715/adaptive-kv-memory/blob/main/docs/technical_blog.md) • [Architecture](https://github.com/Arvind679715/adaptive-kv-memory/blob/main/docs/architecture.md) • [Benchmarks](#benchmarks) • [Getting Started](#quickstart)**
 
 </div>
 
