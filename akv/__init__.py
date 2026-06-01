@@ -12,7 +12,7 @@ For model-aware setup:
     cache = AKVCache.for_model(model, preset="balanced",
                                protect_first=2, protect_last=2)
 """
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # --- Drop-in API (what most users need) ---
 from akv.drop_in import AKVCache, AKVLayer, recommend_preset
