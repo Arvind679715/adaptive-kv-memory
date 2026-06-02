@@ -13,9 +13,12 @@ Implements the key competing approaches from recent literature:
 5. **ScissorHands** — Liu et al. 2023
    Persistence-of-importance: tokens important across multiple steps
    are kept; tokens with transient importance are evicted.
-
-All baselines implement a common interface so they can be swapped
-into our evaluation framework directly.
+6. **StreamingLLM** — Xiao et al. 2024
+   Attention sinks (first few tokens) + sliding window of recent tokens.
+   No importance scoring—purely positional.
+7. **PyramidKV** — Cai et al. 2024
+   Layer-aware budget allocation: lower layers get more KV budget,
+   upper layers get less, based on attention entropy patterns.
 """
 from __future__ import annotations
 
@@ -660,6 +663,232 @@ class ScissorHandsCache(BaseKVCache):
 
 
 # ============================================================
+# 6. StreamingLLM — Attention Sinks + Window (Xiao et al., 2024)
+# ============================================================
+
+@dataclass
+class StreamingLLMConfig:
+    """Configuration for StreamingLLM cache.
+
+    Based on: "Efficient Streaming Language Models with Attention Sinks"
+    (Xiao et al., ICLR 2024)
+    """
+    sink_tokens: int = 4         # number of initial "attention sink" tokens to keep
+    recent_window: int = 1020    # sliding window size for recent tokens
+    # Effective budget = sink_tokens + recent_window
+
+
+class StreamingLLMCache(BaseKVCache):
+    """StreamingLLM KV cache with attention sinks.
+
+    Strategy: keep the first `sink_tokens` (typically 4, including BOS)
+    and the last `recent_window` tokens. Everything in between is evicted.
+    No importance scoring is used—purely positional selection.
+
+    Key insight: initial tokens act as "attention sinks" that receive
+    disproportionate attention mass regardless of content. Keeping them
+    stabilizes the softmax distribution for infinite-length generation.
+
+    Strengths: zero overhead, enables infinite-length streaming.
+    Weaknesses: no importance-awareness—tokens between sinks and
+    recent window are permanently lost regardless of their value.
+    Cannot handle delayed recall of early-context information.
+    """
+
+    def __init__(self, config: Optional[StreamingLLMConfig] = None):
+        self.config = config or StreamingLLMConfig()
+        self._keys: dict[int, torch.Tensor] = {}
+        self._values: dict[int, torch.Tensor] = {}
+
+    def update(self, key_states, value_states, layer_idx, attention_weights=None):
+        cfg = self.config
+        budget = cfg.sink_tokens + cfg.recent_window
+
+        if layer_idx in self._keys:
+            self._keys[layer_idx] = torch.cat([self._keys[layer_idx], key_states], dim=2)
+            self._values[layer_idx] = torch.cat([self._values[layer_idx], value_states], dim=2)
+        else:
+            self._keys[layer_idx] = key_states
+            self._values[layer_idx] = value_states
+
+        seq_len = self._keys[layer_idx].shape[2]
+
+        # Evict if over budget: keep sinks + recent window
+        if seq_len > budget:
+            sink_k = self._keys[layer_idx][:, :, :cfg.sink_tokens, :]
+            sink_v = self._values[layer_idx][:, :, :cfg.sink_tokens, :]
+            recent_k = self._keys[layer_idx][:, :, -cfg.recent_window:, :]
+            recent_v = self._values[layer_idx][:, :, -cfg.recent_window:, :]
+            self._keys[layer_idx] = torch.cat([sink_k, recent_k], dim=2)
+            self._values[layer_idx] = torch.cat([sink_v, recent_v], dim=2)
+
+        return self._keys[layer_idx], self._values[layer_idx]
+
+    def get_seq_length(self, layer_idx=0):
+        if layer_idx not in self._keys:
+            return 0
+        return self._keys[layer_idx].shape[2]
+
+    def reset(self):
+        self._keys.clear()
+        self._values.clear()
+
+    def memory_bytes(self):
+        total = 0
+        for k in self._keys.values():
+            total += k.nbytes
+        for v in self._values.values():
+            total += v.nbytes
+        return total
+
+
+# ============================================================
+# 7. PyramidKV — Layer-Aware Budget Allocation (Cai et al., 2024)
+# ============================================================
+
+@dataclass
+class PyramidKVConfig:
+    """Configuration for PyramidKV cache.
+
+    Based on: "PyramidKV: Dynamic KV Cache Compression based on
+    Pyramidal Information Funneling" (Cai et al., 2024)
+    """
+    total_budget: int = 1024     # total KV budget across all layers
+    num_layers: int = 22         # number of model layers
+    pyramid_ratio: str = "linear"  # 'linear' or 'equal'
+    # linear: lower layers get more budget, upper layers less
+    recent_window: int = 64      # always keep recent tokens per layer
+    initial_tokens_protected: int = 4
+
+
+class PyramidKVCache(BaseKVCache):
+    """PyramidKV cache with layer-aware budget allocation.
+
+    Strategy: allocate KV budgets non-uniformly across layers based on
+    the observation that lower layers have higher attention entropy
+    (attend more broadly) while upper layers have lower entropy
+    (attend more locally). Thus lower layers need more tokens retained.
+
+    The budget follows a pyramid/funnel shape:
+    - Layer 0 gets the most budget
+    - Layer N gets the least budget
+
+    Within each layer, eviction uses attention-based importance (similar
+    to H2O) but with the per-layer budget constraint.
+
+    Strengths: respects layer-level attention patterns, better memory
+    allocation than uniform budgets.
+    Weaknesses: still eviction-based—tokens are permanently lost.
+    Fixed pyramid shape may not suit all architectures.
+    """
+
+    def __init__(self, config: Optional[PyramidKVConfig] = None):
+        self.config = config or PyramidKVConfig()
+        self._keys: dict[int, torch.Tensor] = {}
+        self._values: dict[int, torch.Tensor] = {}
+        self._scores: dict[int, torch.Tensor] = {}
+        self._layer_budgets = self._compute_layer_budgets()
+
+    def _compute_layer_budgets(self) -> list[int]:
+        """Compute per-layer budgets based on pyramid ratio."""
+        cfg = self.config
+        n = cfg.num_layers
+        if cfg.pyramid_ratio == "equal":
+            per_layer = cfg.total_budget // n
+            return [per_layer] * n
+
+        # Linear pyramid: layer 0 gets 2x average, layer N gets near-zero
+        # budget_i = total * (2 * (N - i)) / (N * (N + 1))
+        weights = [(n - i) for i in range(n)]
+        total_weight = sum(weights)
+        budgets = [max(cfg.recent_window + cfg.initial_tokens_protected,
+                       int(cfg.total_budget * w / total_weight))
+                   for w in weights]
+        return budgets
+
+    def update(self, key_states, value_states, layer_idx, attention_weights=None):
+        device = key_states.device
+
+        if layer_idx in self._keys:
+            self._keys[layer_idx] = torch.cat([self._keys[layer_idx], key_states], dim=2)
+            self._values[layer_idx] = torch.cat([self._values[layer_idx], value_states], dim=2)
+        else:
+            self._keys[layer_idx] = key_states
+            self._values[layer_idx] = value_states
+
+        seq_len = self._keys[layer_idx].shape[2]
+
+        # Update attention scores
+        if attention_weights is not None:
+            new_importance = attention_weights.float().mean(dim=(0, 1)).sum(dim=0)
+            if layer_idx not in self._scores:
+                self._scores[layer_idx] = new_importance.to(device)
+            else:
+                old = self._scores[layer_idx]
+                if old.shape[0] < new_importance.shape[0]:
+                    expanded = torch.zeros(new_importance.shape[0], device=device)
+                    expanded[:old.shape[0]] = old
+                    old = expanded
+                old[:new_importance.shape[0]] += new_importance.to(device)
+                self._scores[layer_idx] = old
+
+        # Get per-layer budget
+        budget = self._layer_budgets[layer_idx] if layer_idx < len(self._layer_budgets) else self._layer_budgets[-1]
+
+        # Evict if over budget
+        if seq_len > budget:
+            self._evict(layer_idx, budget)
+
+        return self._keys[layer_idx], self._values[layer_idx]
+
+    def _evict(self, layer_idx: int, budget: int):
+        cfg = self.config
+        seq_len = self._keys[layer_idx].shape[2]
+        device = self._keys[layer_idx].device
+
+        if layer_idx in self._scores and self._scores[layer_idx].shape[0] >= seq_len:
+            scores = self._scores[layer_idx][:seq_len].clone()
+        else:
+            scores = torch.zeros(seq_len, device=device)
+
+        # Protect recent window
+        recent_start = max(0, seq_len - cfg.recent_window)
+        scores[recent_start:] = float('inf')
+
+        # Protect initial tokens
+        n_protect = min(cfg.initial_tokens_protected, seq_len)
+        scores[:n_protect] = float('inf')
+
+        # Keep top-budget by score
+        n_keep = min(budget, seq_len)
+        _, keep_indices = scores.topk(n_keep)
+        keep_indices = keep_indices.sort().values
+
+        self._keys[layer_idx] = self._keys[layer_idx][:, :, keep_indices, :].contiguous()
+        self._values[layer_idx] = self._values[layer_idx][:, :, keep_indices, :].contiguous()
+        if layer_idx in self._scores:
+            self._scores[layer_idx] = self._scores[layer_idx][keep_indices]
+
+    def get_seq_length(self, layer_idx=0):
+        if layer_idx not in self._keys:
+            return 0
+        return self._keys[layer_idx].shape[2]
+
+    def reset(self):
+        self._keys.clear()
+        self._values.clear()
+        self._scores.clear()
+
+    def memory_bytes(self):
+        total = 0
+        for k in self._keys.values():
+            total += k.nbytes
+        for v in self._values.values():
+            total += v.nbytes
+        return total
+
+
+# ============================================================
 # Factory
 # ============================================================
 
@@ -667,7 +896,8 @@ def create_baseline(name: str, **kwargs) -> BaseKVCache:
     """Create a baseline KV cache by name.
 
     Args:
-        name: One of 'full', 'h2o', 'kivi', 'snapkv', 'scissorhands'
+        name: One of 'full', 'h2o', 'kivi', 'snapkv', 'scissorhands',
+              'streamingllm', 'pyramidkv'
         **kwargs: Passed to the config constructor
 
     Returns:
@@ -684,6 +914,11 @@ def create_baseline(name: str, **kwargs) -> BaseKVCache:
         return SnapKVCache(SnapKVConfig(**kwargs))
     elif name in ("scissorhands", "scissors"):
         return ScissorHandsCache(ScissorHandsConfig(**kwargs))
+    elif name in ("streamingllm", "streaming"):
+        return StreamingLLMCache(StreamingLLMConfig(**kwargs))
+    elif name in ("pyramidkv", "pyramid"):
+        return PyramidKVCache(PyramidKVConfig(**kwargs))
     else:
         raise ValueError(f"Unknown baseline: {name}. "
-                        f"Choose from: full, h2o, kivi, snapkv, scissorhands")
+                        f"Choose from: full, h2o, kivi, snapkv, scissorhands, "
+                        f"streamingllm, pyramidkv")

@@ -32,7 +32,10 @@ from akv.integration import HFAdaptiveCache, HFProductionCache
 from akv.baselines import (
     FullCache, H2OCache, H2OConfig,
     KIVICache, KIVIConfig, SnapKVCache, SnapKVConfig,
-    ScissorHandsCache, ScissorHandsConfig, create_baseline,
+    ScissorHandsCache, ScissorHandsConfig,
+    StreamingLLMCache, StreamingLLMConfig,
+    PyramidKVCache, PyramidKVConfig,
+    create_baseline,
 )
 from akv.triton_ops import (
     fused_quantized_attention, fused_mixed_precision_attention,

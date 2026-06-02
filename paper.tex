@@ -68,7 +68,9 @@ For Llama-2-7B ($L=32$, $H=32$, $d=128$) at FP16, this is $32S$ bytes per token 
 
 \subsection{Eviction Methods}
 
-H2O~\cite{h2o} identifies ``heavy hitter'' tokens that accumulate high attention mass and retains only these plus a recent window. SnapKV~\cite{snapkv} uses the observation window (last $N$ query positions) to select important tokens during prefill, then fixes the selection for generation. ScissorHands~\cite{scissorhands} uses a persistence filter to keep tokens with consistent importance. All three share a fundamental limitation: once a token is evicted, it cannot be recovered. While SnapKV's prefill-time selection can be remarkably effective (achieving perfect passkey recall in our experiments), it still bounds the effective context to its budget size---tokens beyond the budget are permanently lost regardless of future relevance.
+H2O~\cite{h2o} identifies ``heavy hitter'' tokens that accumulate high attention mass and retains only these plus a recent window. SnapKV~\cite{snapkv} uses the observation window (last $N$ query positions) to select important tokens during prefill, then fixes the selection for generation. ScissorHands~\cite{scissorhands} uses a persistence filter to keep tokens with consistent importance. StreamingLLM~\cite{streamingllm} takes a minimalist approach: keep the first few ``attention sink'' tokens plus a fixed-size sliding window, discarding everything in between without any importance scoring. PyramidKV~\cite{pyramidkv} introduces layer-aware budget allocation, observing that lower layers have higher attention entropy and allocating more KV budget to them in a pyramidal pattern.
+
+All eviction methods share a fundamental limitation: once a token is evicted, it cannot be recovered. While SnapKV's prefill-time selection can be remarkably effective (achieving perfect passkey recall in our experiments), it still bounds the effective context to its budget size---tokens beyond the budget are permanently lost regardless of future relevance.
 
 \subsection{Quantization Methods}
 
@@ -143,6 +145,11 @@ The importance score for token $i$ after chunk $t$ is updated via exponential mo
 where $a_{i,\text{last}}^{(t)} = \text{mean}_{h}(\text{Attn}[h, q_{\text{last}}, i])$ is the attention from the last query position to token $i$, averaged across heads. We use $\lambda = 0.3$ (fast decay) so anchors must maintain ongoing relevance.
 
 When the hot tier exceeds budget, we demote the lowest-scored tokens from the eligible region (all positions except the protected recency window). The default configuration uses $n_{\text{anchors}} = 16$ with $\text{protect\_recent} = B - 16$, validated to win at both 4-bit (+0.97\%) and 2-bit (+8.08\%) over FIFO (Section~\ref{sec:importance_demotion}).
+
+\paragraph{Theoretical justification.}
+The hot-tier selection problem can be framed as monotone submodular maximization under a cardinality constraint. Define the \textit{attention coverage function} $f(S) = \sum_{t=1}^{T} \min\left(1,\; \sum_{i \in S} a_{i}^{(t)}\right)$ for a set $S$ of retained tokens, where $a_i^{(t)}$ is the normalized attention mass on token $i$ at decode step $t$. This function is submodular (adding a token to a smaller set provides at least as much marginal coverage as adding it to a larger set) and monotone. The classic result of Nemhauser et al.~(1978) guarantees that the greedy algorithm---selecting the token with highest marginal gain at each step---achieves a $(1 - 1/e) \approx 0.63$ approximation ratio.
+
+Our importance scoring approximates this greedy selection: the EMA score $\text{score}_i^{(t)}$ tracks cumulative marginal attention contribution, and selecting the top-$k$ scored tokens is equivalent to greedy submodular maximization with an exponential time discount. The decay factor $\lambda = 0.3$ ensures the selection adapts to non-stationary attention patterns (unlike the static version analyzed by Nemhauser), prioritizing tokens relevant to recent queries. While this online adaptation forfeits the exact $(1-1/e)$ guarantee, it inherits the same structural advantage: importance-aware selection provably outperforms any age-based (FIFO) policy when attention mass is non-uniformly distributed---which is empirically always the case in LLMs due to attention sinks~\cite{streamingllm}.
 
 \subsection{Retrieval-Aware Promotion}
 
@@ -820,6 +827,15 @@ Bai, Y., et al. ``LongBench: A Bilingual, Multitask Benchmark for Long Context U
 
 \bibitem{ruler}
 Hsieh, C.-Y., et al. ``RULER: What's the Real Context Size of Your Long-Context Language Models?'' \textit{COLM 2024}.
+
+\bibitem{streamingllm}
+Xiao, G., et al. ``Efficient Streaming Language Models with Attention Sinks.'' \textit{ICLR 2024}.
+
+\bibitem{pyramidkv}
+Cai, Z., et al. ``PyramidKV: Dynamic KV Cache Compression based on Pyramidal Information Funneling.'' 2024.
+
+\bibitem{nemhauser}
+Nemhauser, G.~L., Wolsey, L.~A., and Fisher, M.~L. ``An analysis of approximations for maximizing submodular set functions---I.'' \textit{Mathematical Programming}, 14(1):265--294, 1978.
 
 \bibitem{lloydmax}
 Lloyd, S. ``Least squares quantization in PCM.'' \textit{IEEE Trans. Info. Theory}, 1982.
