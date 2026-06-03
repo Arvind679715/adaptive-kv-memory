@@ -12,10 +12,16 @@ For model-aware setup:
     cache = AKVCache.for_model(model, preset="balanced",
                                protect_first=2, protect_last=2)
 """
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # --- Drop-in API (what most users need) ---
 from akv.drop_in import AKVCache, AKVLayer, recommend_preset
+
+# --- Calibration & adapters (production setup) ---
+from akv.calibration import CalibrationReport, HeadSensitivity, calibrate_model
+from akv.adapters import (
+    AdapterSpec, get_adapter, list_adapters, register_adapter, resolve_for_model,
+)
 
 # --- Production API (for serving systems) ---
 from akv.production_cache import ProductionCache, ProductionCacheConfig
@@ -64,6 +70,10 @@ from akv.vmm import (
 __all__ = [
     # Drop-in (recommended for most users)
     "AKVCache", "AKVLayer", "recommend_preset",
+    # Calibration + adapters
+    "calibrate_model", "CalibrationReport", "HeadSensitivity",
+    "AdapterSpec", "get_adapter", "list_adapters",
+    "register_adapter", "resolve_for_model",
     # Production serving
     "ProductionCache", "ProductionCacheConfig",
     "AdaptiveGenerator", "GeneratorConfig", "adaptive_pipeline",

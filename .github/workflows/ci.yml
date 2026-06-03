@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # Matrix: validate AKV works across Python and transformers versions.
+  # The transformers `Cache` / `DynamicCache` API has churned heavily
+  # from 4.36 -> 4.55; we pin known good versions and also test "latest".
+  # ============================================================
+  test:
+    name: py${{ matrix.python }} / transformers ${{ matrix.transformers }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+        transformers: ["4.40.2", "4.45.2", "4.50.3", "latest"]
+        exclude:
+          # transformers 4.40 dropped py3.12 wheels for some sub-deps
+          - python: "3.12"
+            transformers: "4.40.2"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install torch (CPU)
+        run: |
+          pip install --upgrade pip
+          pip install "torch>=2.1,<2.6" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install transformers (${{ matrix.transformers }})
+        run: |
+          if [ "${{ matrix.transformers }}" = "latest" ]; then
+            pip install -U transformers
+          else
+            pip install "transformers==${{ matrix.transformers }}"
+          fi
+
+      - name: Install AKV (dev extras)
+        run: pip install -e ".[dev]"
+
+      - name: Show environment
+        run: |
+          python -c "import sys, torch, transformers; print('python', sys.version); print('torch', torch.__version__); print('transformers', transformers.__version__)"
+          python -m akv.cli info || true
+
+      - name: Lint
+        run: ruff check akv tests || true
+
+      - name: Run unit tests
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+          TOKENIZERS_PARALLELISM: "false"
+        run: pytest -x -q tests/ --ignore=tests/test_triton_ops.py --ignore=tests/test_turbo_quant.py -k "not cuda and not triton"
+
+      - name: Smoke test drop-in cache (tiny model)
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+          TOKENIZERS_PARALLELISM: "false"
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: |
+          python - <<'PY'
+          # Use a *tiny* random model so we don't download GB of weights.
+          # This is the canonical smoke test for the DynamicCache subclass contract.
+          import torch
+          from transformers import AutoConfig, AutoModelForCausalLM
+          from akv import AKVCache
+
+          cfg = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-LlamaForCausalLM")
+          model = AutoModelForCausalLM.from_config(cfg).eval()
+          ids = torch.randint(0, cfg.vocab_size, (1, 16))
+          cache = AKVCache(preset="balanced")
+          with torch.no_grad():
+              out = model(input_ids=ids, past_key_values=cache, use_cache=True)
+          assert out.past_key_values is not None
+          # second pass with one new token
+          new_ids = torch.randint(0, cfg.vocab_size, (1, 1))
+          with torch.no_grad():
+              out2 = model(input_ids=new_ids, past_key_values=out.past_key_values, use_cache=True)
+          print("OK: AKVCache compatible with transformers", __import__("transformers").__version__)
+          PY
+
+  # ============================================================
+  # Build wheel + sdist on every commit (catches packaging bugs early).
+  # ============================================================
+  build:
+    name: build (sdist + wheel)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ github.sha }}
+          path: dist/

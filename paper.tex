@@ -16,7 +16,7 @@
 
 \title{\textbf{AKV: A Virtual Memory System for LLM KV Cache with Retrieval-Preserving Hierarchical Compression}}
 
-\author{Arvind S.}
+\author{Arvind S.\thanks{Code: \url{https://github.com/Arvind679715/adaptive-kv-memory} \quad Package: \texttt{pip install akv-cache} (\url{https://pypi.org/project/akv-cache/}).}}
 \affil{Independent Research \\ \texttt{arvind679715@gmail.com}}
 
 \date{May 2026}
@@ -783,6 +783,18 @@ We discovered that amortized migration checks (every 8 update calls) can cause p
     \item \textbf{RULER degradation at long context}: As shown in Table~\ref{tab:ruler}, AKV's generative retrieval accuracy degrades at 4K+ when the hot budget is a small fraction of total context. Adaptive hot budget scaling (e.g., $\text{hot} = \max(512, 0.25 \times N)$) or importance-pinning of high-attention outlier tokens could address this.
     \item \textbf{Learned policies}: The current migration/promotion policies use hand-tuned thresholds. A lightweight policy network trained on attention patterns could further improve placement decisions.
     \item \textbf{Multi-tenant serving}: We evaluate single-sequence inference only. Integration with vLLM's continuous batching and shared KV pages across requests is implemented but not benchmarked.
+\end{itemize}
+
+% ============================================================================
+\section{Code and Reproducibility}
+
+AKV is released as an open-source Python package. All experimental results in this paper can be reproduced using the provided benchmark scripts.
+
+\begin{itemize}
+    \item \textbf{Source code:} \url{https://github.com/Arvind679715/adaptive-kv-memory}
+    \item \textbf{PyPI package:} \url{https://pypi.org/project/akv-cache/} (\texttt{pip install akv-cache})
+    \item \textbf{Reproducing results:} WikiText-2 perplexity (Tables 1--3) via \texttt{python -m akv.benchmark --task ppl}; passkey retrieval (Table 7) via \texttt{python -m benchmarks.delayed\_recall}; LongBench (Table 11) via \texttt{python -m benchmarks.longbench\_eval}; throughput (Table 13) via \texttt{python -m benchmarks.throughput\_bench}.
+    \item \textbf{Integration:} HuggingFace-compatible drop-in cache (\texttt{akv.cache.AKVCache}) and vLLM adapter (\texttt{akv.vllm\_integration}).
 \end{itemize}
 
 % ============================================================================

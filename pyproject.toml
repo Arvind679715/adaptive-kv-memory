@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "akv-cache"
-version = "1.1.0"
+version = "1.2.0"
 description = "Retrieval-preserving hierarchical KV cache compression for long-context LLM inference"
 readme = "README.md"
 license = "Apache-2.0"

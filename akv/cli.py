@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from pathlib import Path
 
 
 def cmd_generate(args: argparse.Namespace) -> None:
@@ -102,6 +103,55 @@ def cmd_info(args: argparse.Namespace) -> None:
         print(f"  Transformers: not installed")
 
 
+def cmd_adapters(args: argparse.Namespace) -> None:
+    """List supported model architectures."""
+    from akv.adapters import list_adapters
+    print(f"{'family':<35} {'model_type':<18} {'preset':<10} status")
+    print("-" * 80)
+    for spec in list_adapters():
+        status = "ok" if spec.supported else "UNSUPPORTED"
+        print(f"{spec.family:<35} {spec.model_type:<18} {spec.default_preset:<10} {status}")
+        if args.verbose and spec.notes:
+            for line in spec.notes.split("\n"):
+                print(f"    {line}")
+
+
+def cmd_calibrate(args: argparse.Namespace) -> None:
+    """Run a calibration pass and save a config the user can re-load."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from akv.calibration import calibrate_model
+
+    print(f"Loading model: {args.model}")
+    device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+
+    tok = AutoTokenizer.from_pretrained(args.model)
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype).to(device)
+
+    print(f"Calibrating on {device} (target {args.target_bits}b avg) ...")
+    sample_texts = None
+    if args.calibration_file:
+        sample_texts = [Path(args.calibration_file).read_text()]
+
+    report = calibrate_model(
+        model, tok,
+        sample_texts=sample_texts,
+        max_length=args.max_length,
+        max_layers_to_probe=args.probe_layers,
+        target_average_bits=args.target_bits,
+        device=device,
+    )
+    print("")
+    print(report.summary)
+    print("")
+    print(f"Calibration took {report.calibration_seconds:.1f}s")
+
+    out = Path(args.output)
+    report.save(out)
+    print(f"Saved calibration to: {out}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="akv",
@@ -131,12 +181,39 @@ def main() -> None:
     # info
     sub.add_parser("info", help="Show system info and available features")
 
+    # adapters
+    adapters_p = sub.add_parser("adapters", help="List supported model architectures")
+    adapters_p.add_argument("-v", "--verbose", action="store_true",
+                            help="Show notes / caveats for each adapter")
+
+    # calibrate
+    cal_p = sub.add_parser("calibrate",
+                           help="Run calibration on a model and save a JSON config")
+    cal_p.add_argument("--model", type=str, required=True,
+                       help="HuggingFace model id or local path")
+    cal_p.add_argument("--output", "-o", type=str, default="akv_calibration.json")
+    cal_p.add_argument("--calibration-file", type=str, default=None,
+                       help="Optional path to a text file used as calibration data")
+    cal_p.add_argument("--max-length", type=int, default=1024)
+    cal_p.add_argument("--probe-layers", type=int, default=8,
+                       help="Number of layers to probe (rest extrapolated)")
+    cal_p.add_argument("--target-bits", type=float, default=3.0,
+                       help="Target average bits per head (2.0 - 4.0)")
+    cal_p.add_argument("--cpu", action="store_true",
+                       help="Force CPU even if CUDA is available")
+
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
         sys.exit(0)
 
-    {"generate": cmd_generate, "bench": cmd_bench, "info": cmd_info}[args.command](args)
+    {
+        "generate": cmd_generate,
+        "bench": cmd_bench,
+        "info": cmd_info,
+        "adapters": cmd_adapters,
+        "calibrate": cmd_calibrate,
+    }[args.command](args)
 
 
 def _get_version() -> str:

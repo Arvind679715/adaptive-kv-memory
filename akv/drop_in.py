@@ -111,6 +111,7 @@ class AKVLayer:
         protect: bool = False,
         enable_promotion: bool = True,
         promotion_threshold: float = 0.05,
+        per_head_bits: Optional[list[int]] = None,
     ):
         self.warm_bits = warm_bits
         self.hot_budget = hot_budget
@@ -118,6 +119,12 @@ class AKVLayer:
         self.protect = protect  # If True, keep all tokens at FP16
         self.enable_promotion = enable_promotion
         self.promotion_threshold = promotion_threshold
+        # Per-head bit override from calibration. If set, the demotion path
+        # quantizes each KV-head with its own bit-width instead of using the
+        # single global `warm_bits` value.
+        self.per_head_bits: Optional[list[int]] = (
+            list(per_head_bits) if per_head_bits is not None else None
+        )
 
         # State
         self._hot_keys: Optional[torch.Tensor] = None   # (B, H, N_hot, D)
@@ -133,23 +140,74 @@ class AKVLayer:
         self._n_anchors: int = 16
         self._step: int = 0
 
-        # Quantizer (lazy init)
+        # Quantizer (lazy init); when per_head_bits is set we maintain a
+        # pool keyed by bit-width so heads with the same width share state.
         self._quantizer = None
+        self._quantizer_pool: dict[int, object] = {}
 
-    def _ensure_quantizer(self, head_dim: int, device):
-        """Lazy-init NormQuant quantizer on first use."""
-        if self._quantizer is not None:
-            return
+    def _make_quantizer(self, bits: int):
+        """Construct a TurboQuantizer at a given bit-width, or None."""
         try:
             from akv.turbo_quant import TurboQuantizer, TurboQuantConfig
-            self._quantizer = TurboQuantizer(TurboQuantConfig(
-                key_bits=self.warm_bits,
-                value_bits=self.warm_bits,
+            return TurboQuantizer(TurboQuantConfig(
+                key_bits=bits,
+                value_bits=bits,
                 group_size=self.group_size,
                 rotation="hadamard",
             ))
         except ImportError:
-            self._quantizer = None
+            return None
+
+    def _ensure_quantizer(self, head_dim: int, device):
+        """Lazy-init the default NormQuant quantizer (and the per-head pool)."""
+        if self._quantizer is None:
+            self._quantizer = self._make_quantizer(self.warm_bits)
+        if self.per_head_bits:
+            for b in set(self.per_head_bits):
+                if b not in self._quantizer_pool:
+                    self._quantizer_pool[b] = self._make_quantizer(b)
+
+    def _quantize_per_head(self, k: torch.Tensor, v: torch.Tensor
+                           ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize K/V slice (B, H, N, D) with per-head bit-widths.
+
+        Falls back to the global quantizer when per_head_bits is unset or the
+        head count mismatches. Always returns FP16 (dequantized) tensors so
+        downstream attention paths stay unchanged.
+        """
+        if (
+            not self.per_head_bits
+            or self._quantizer is None
+            or k.shape[1] != len(self.per_head_bits)
+        ):
+            qk = self._quantizer.quantize_keys(k.squeeze(0))
+            qv = self._quantizer.quantize_values(v.squeeze(0))
+            return (
+                self._quantizer.dequantize_keys(qk).unsqueeze(0),
+                self._quantizer.dequantize_values(qv).unsqueeze(0),
+            )
+
+        out_k = torch.empty_like(k)
+        out_v = torch.empty_like(v)
+        for h, bits in enumerate(self.per_head_bits):
+            qz = self._quantizer_pool.get(bits) or self._quantizer
+            if qz is None:
+                out_k[:, h] = k[:, h]
+                out_v[:, h] = v[:, h]
+                continue
+            # Quantize this head only: shape (B, N, D) -> (1, N, D) view
+            kh = k[:, h:h+1].squeeze(0)
+            vh = v[:, h:h+1].squeeze(0)
+            try:
+                qkh = qz.quantize_keys(kh)
+                qvh = qz.quantize_values(vh)
+                out_k[:, h] = qz.dequantize_keys(qkh).squeeze(0)
+                out_v[:, h] = qz.dequantize_values(qvh).squeeze(0)
+            except Exception:
+                # Robust fallback: passthrough on per-head failure
+                out_k[:, h] = k[:, h]
+                out_v[:, h] = v[:, h]
+        return out_k, out_v
 
     def _update_importance(self, n_new: int, hot_len: int):
         """Update importance scores using recency decay.
@@ -295,11 +353,7 @@ class AKVLayer:
 
             # Actually quantize with NormQuant (no calibration needed)
             if self._quantizer is not None:
-                # Quantize → dequantize (lossy compression)
-                qk = self._quantizer.quantize_keys(demote_k.squeeze(0))
-                qv = self._quantizer.quantize_values(demote_v.squeeze(0))
-                demote_k = self._quantizer.dequantize_keys(qk).unsqueeze(0)
-                demote_v = self._quantizer.dequantize_values(qv).unsqueeze(0)
+                demote_k, demote_v = self._quantize_per_head(demote_k, demote_v)
 
             # Append to warm tier
             if self._warm_keys_fp16 is None:
@@ -475,6 +529,9 @@ class AKVCache(_get_dynamic_cache_base()):
         # Per-layer caches (lazily created)
         self.layers: list[AKVLayer] = []
         self._seen_tokens: int = 0
+        # Optional per-(layer, head) bit assignment from `akv calibrate`.
+        # Map layer_idx -> list[bits per KV-head]. Applied at layer creation.
+        self._calibration_per_head_bits: dict[int, list[int]] = {}
 
         # Initialize base class (DynamicCache or Cache)
         base = _get_dynamic_cache_base()
@@ -488,7 +545,9 @@ class AKVCache(_get_dynamic_cache_base()):
     def for_model(cls, model, **kwargs) -> "AKVCache":
         """Build cache with architecture info read from model.config.
 
-        Required for protect_last or negative protect_layers indices.
+        Consults the adapter registry to pick sensible defaults for the
+        model family (Llama, Mistral, Qwen, Gemma, Phi, ...). User kwargs
+        always win over adapter defaults.
 
         Example:
             cache = AKVCache.for_model(model, preset="balanced",
@@ -505,6 +564,25 @@ class AKVCache(_get_dynamic_cache_base()):
                 "Could not find num_hidden_layers in model.config. "
                 "Pass num_hidden_layers= explicitly."
             )
+
+        # Consult adapter registry for arch-specific defaults
+        try:
+            from akv.adapters import resolve_for_model
+            spec = resolve_for_model(model)
+            if spec.kv_compressed:
+                logger.warning(
+                    "Model '%s' uses compressed KV (MLA); AKV adds little "
+                    "value and may interfere. Returning a passthrough cache.",
+                    spec.model_type,
+                )
+            # Apply defaults only if user hasn't overridden
+            kwargs.setdefault("preset", spec.default_preset)
+            kwargs.setdefault("protect_first", spec.protect_initial)
+            kwargs.setdefault("protect_last", spec.protect_recent)
+            if spec.warm_bits_override is not None:
+                kwargs.setdefault("warm_bits", spec.warm_bits_override)
+        except Exception as e:  # registry is best-effort, never fatal
+            logger.debug("Adapter registry lookup failed: %s", e)
 
         return cls(num_hidden_layers=n_layers, **kwargs)
 
@@ -532,6 +610,8 @@ class AKVCache(_get_dynamic_cache_base()):
                 protect=self._is_protected(idx),
                 enable_promotion=self.enable_promotion,
                 promotion_threshold=self.promotion_threshold,
+                per_head_bits=self._calibration_per_head_bits.get(idx)
+                if self._calibration_per_head_bits else None,
             ))
 
         # Track seen tokens (on first layer only)
@@ -689,6 +769,41 @@ class AKVCache(_get_dynamic_cache_base()):
         if past_key_values is not None:
             for layer_idx, (k, v) in enumerate(past_key_values):
                 cache.update(k, v, layer_idx)
+        return cache
+
+    @classmethod
+    def from_calibration(cls, calibration_path, **overrides) -> "AKVCache":
+        """Build an AKVCache from a CalibrationReport JSON file.
+
+        Use `akv calibrate --model ... -o calib.json` to produce one, then::
+
+            from akv import AKVCache
+            cache = AKVCache.from_calibration("calib.json")
+
+        Per-head bit assignments from the report are applied where possible;
+        global recommendations (preset, protect window) are applied as defaults.
+        User overrides via **overrides always win.
+        """
+        from akv.calibration import CalibrationReport
+        report = CalibrationReport.load(calibration_path)
+        kwargs = dict(
+            protect_first=report.recommended_protect_first,
+            protect_last=report.recommended_protect_last,
+            num_hidden_layers=report.num_layers,
+        )
+        # warm_bits and preset are mutually exclusive; prefer the more
+        # specific per-head average from calibration when it is meaningful,
+        # otherwise fall back to the preset.
+        if 2.0 <= report.recommended_average_bits <= 4.0:
+            kwargs["warm_bits"] = int(round(report.recommended_average_bits))
+        else:
+            kwargs["preset"] = report.recommended_preset
+        kwargs.update(overrides)
+        cache = cls(**kwargs)
+        # Apply per-(layer, head) bit assignments. JSON keys are strings; coerce.
+        cache._calibration_per_head_bits = {
+            int(k): list(v) for k, v in report.per_head_bits.items()
+        }
         return cache
 
 
