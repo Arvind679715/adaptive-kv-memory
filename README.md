@@ -8,7 +8,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.1+](https://img.shields.io/badge/pytorch-2.1+-ee4c2c.svg)](https://pytorch.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
+[![CI](https://github.com/Arvind679715/adaptive-kv-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/Arvind679715/adaptive-kv-memory/actions/workflows/ci.yml)
 
 **[Technical Blog](https://github.com/Arvind679715/adaptive-kv-memory/blob/main/docs/technical_blog.md) • [Architecture](https://github.com/Arvind679715/adaptive-kv-memory/blob/main/docs/architecture.md) • [Benchmarks](#benchmarks) • [Getting Started](#quickstart)**
 
@@ -34,6 +34,13 @@ We introduce **Adaptive KV Memory (AKV)**, a hierarchical KV cache management en
 - **OpenAI-compatible server** — `akv-server` for instant deployment with chat completions API.
 - **Model diagnostics** — `diagnose_model()` auto-recommends the optimal preset for your model.
 - **DynamicCache subclass** — fully compatible with beam search, `generate()`, and all HF generation strategies.
+
+## What's New in v1.2.0
+
+- **Per-head calibration pipeline** — `akv calibrate` produces a JSON report; `AKVCache.from_calibration()` assigns each KV-head its own bit-width (2/3/4) to hit a target average budget.
+- **Model adapter registry** — 12 families supported out of the box (Llama, TinyLlama, Mistral/Mixtral with SWA, Qwen2, Gemma/Gemma-2, Phi-3, GPT-2, OPT, BLOOM). Inspect with `akv adapters --verbose`.
+- **vLLM upstream-ready shim** — `from akv.vllm_backend import create_akv_llm` matches the proposed `LLM(kv_cache_backend="akv")` API. See [docs/vllm_pr.md](docs/vllm_pr.md).
+- **CI matrix** — tested on Python 3.10/3.11/3.12 × transformers 4.40 → latest.
 
 ## Motivation
 
@@ -227,8 +234,33 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ### Model-Aware Setup
 
 ```python
-# Auto-configures based on model architecture
+# Auto-configures based on model architecture via the adapter registry
+# (Llama, Mistral SWA, Mixtral, Qwen2, Gemma/2, Phi-3, GPT-2, OPT, BLOOM, ...)
 cache = AKVCache.for_model(model, preset="balanced", protect_first=2, protect_last=2)
+```
+
+List supported families from the CLI:
+
+```bash
+akv adapters --verbose
+```
+
+### Per-Head Calibration (New in v1.2.0)
+
+Run a short calibration pass to assign each KV-head its own bit-width (2/3/4) based on quantization sensitivity:
+
+```bash
+akv calibrate --model meta-llama/Llama-2-7b-hf \
+              --output llama2_calib.json \
+              --target-bits 3.0
+```
+
+Then load the report directly into a cache:
+
+```python
+from akv import AKVCache
+cache = AKVCache.from_calibration("llama2_calib.json")
+# Sensitive heads keep 4-bit; tolerant heads drop to 2-bit, hitting the average budget.
 ```
 
 ### Diagnostics
@@ -270,6 +302,23 @@ print(f"Memory: {output.memory_usage['total_mb']:.1f} MB | Speed: {output.tokens
 
 ### vLLM Integration
 
+Stable shim that matches the proposed upstream `kv_cache_backend="akv"` API
+(see [docs/vllm_pr.md](docs/vllm_pr.md) for the upstream PR design):
+
+```python
+from akv.vllm_backend import create_akv_llm
+
+llm = create_akv_llm(
+    "meta-llama/Llama-2-7b-hf",
+    hot_budget_per_seq=1024,
+    warm_budget_per_seq=4096,
+    warm_bits=3,
+)
+outputs = llm.generate(["Summarize: " + long_document], max_tokens=512)
+```
+
+Lower-level integration is also available:
+
 ```python
 from akv.vllm_integration import AdaptiveKVLLM, AdaptiveVLLMConfig
 
@@ -281,7 +330,6 @@ llm = AdaptiveKVLLM(
         warm_bits=4,
     ),
 )
-outputs = llm.generate(["Summarize: " + long_document], max_tokens=512)
 ```
 
 ### Custom Configuration
