@@ -103,6 +103,11 @@ class AKVLayer:
     - Promotion: warm tokens re-accessed get moved back to hot
     """
 
+    # transformers >= 4.46 inspects layer.is_compileable when deciding
+    # whether to use static-cache fast paths. AKVLayer is not torch.compile-
+    # friendly (dynamic tiers, Python-side dequant), so advertise False.
+    is_compileable: bool = False
+
     def __init__(
         self,
         warm_bits: int = 3,
