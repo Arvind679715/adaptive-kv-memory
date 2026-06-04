@@ -107,6 +107,9 @@ class AKVLayer:
     # whether to use static-cache fast paths. AKVLayer is not torch.compile-
     # friendly (dynamic tiers, Python-side dequant), so advertise False.
     is_compileable: bool = False
+    # transformers >= 4.46 reads is_sliding on each cache layer when building
+    # the attention mask. AKV never uses sliding attention.
+    is_sliding: bool = False
 
     def __init__(
         self,
@@ -394,6 +397,19 @@ class AKVLayer:
 
     def get_seq_length(self) -> int:
         return self._total_len
+
+    def get_mask_sizes(self, query_length: int) -> Tuple[int, int]:
+        """Required by CacheLayerMixin contract (transformers >= 4.46).
+
+        Returns (kv_length, kv_offset) where kv_length is the number of
+        cached KV positions (including the new query_length appended this
+        step) and kv_offset is the position of the first cached token.
+        """
+        return (self._total_len + query_length, 0)
+
+    def get_max_cache_shape(self) -> int:
+        """Unbounded cache (tiered compression handles capacity)."""
+        return -1
 
     def memory_usage_bytes(self) -> dict:
         """Memory accounting.
@@ -696,17 +712,38 @@ class AKVCache(_get_dynamic_cache_base()):
         """Convert to tuple-of-tuples format for older transformers."""
         return tuple(self[i] for i in range(len(self.layers)))
 
-    def get_mask_sizes(self, cache_position=None, layer_idx: int = 0):
+    def get_mask_sizes(self, query_length, layer_idx: int = 0):
         """Return (kv_length, kv_offset) for transformers mask creation.
 
-        Required by transformers >= 4.45 masking_utils.
+        transformers >= 4.46 calls this as `cache.get_mask_sizes(query_length, layer_idx)`
+        with two positional ints. `query_length` is the number of NEW query tokens
+        being added this forward pass; kv_length is the total cache length AFTER
+        update (since update() is called before mask creation in modern code paths,
+        the layer already reflects the new tokens).
+
+        We also tolerate the legacy call style where a `cache_position` tensor
+        is passed first — older transformers used that signature.
         """
-        kv_length = self.get_seq_length(layer_idx)
-        if cache_position is not None and len(cache_position) > 0:
-            last_pos = cache_position[-1].item() if hasattr(cache_position[-1], 'item') else int(cache_position[-1])
-            if last_pos >= kv_length:
-                kv_length = last_pos + 1
-        return kv_length, 0
+        # Legacy path: cache_position tensor
+        if isinstance(query_length, torch.Tensor) or (
+            hasattr(query_length, '__len__') and not isinstance(query_length, int)
+        ):
+            cache_position = query_length
+            kv_length = self.get_seq_length(layer_idx)
+            if len(cache_position) > 0:
+                last_pos = (cache_position[-1].item()
+                            if hasattr(cache_position[-1], 'item')
+                            else int(cache_position[-1]))
+                if last_pos >= kv_length:
+                    kv_length = last_pos + 1
+            return kv_length, 0
+
+        # Modern path: two ints. The layer's _total_len already includes the
+        # newly-appended tokens because update() runs before mask creation.
+        if layer_idx < len(self.layers):
+            return self.layers[layer_idx].get_seq_length(), 0
+        # Layer not yet created -> first prefill, kv_length == query_length
+        return int(query_length), 0
 
     @property
     def key_cache(self):
