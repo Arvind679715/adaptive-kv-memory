@@ -363,6 +363,11 @@ class NormQuantizer:
         group_std = grouped.std(dim=1, keepdim=True).clamp(min=1e-8)
         normalized = (grouped - group_mean) / group_std
 
+        # Ensure codebook/boundaries live on the same device as the data.
+        if self._key_boundaries.device != normalized.device:
+            self._key_boundaries = self._key_boundaries.to(normalized.device)
+            self._key_codebook = self._key_codebook.to(normalized.device)
+
         # Quantize normalized values using codebook boundaries
         codes = torch.bucketize(normalized, self._key_boundaries)
 
@@ -388,6 +393,10 @@ class NormQuantizer:
         original_dim = qdata['original_dim']
         rotated_shape = qdata['rotated_shape']
         grouped_shape = qdata.get('grouped_shape', rotated_shape)
+
+        if self._key_codebook.device != codes.device:
+            self._key_codebook = self._key_codebook.to(codes.device)
+            self._key_boundaries = self._key_boundaries.to(codes.device)
 
         # Lookup codebook values (in normalized space)
         reconstructed = self._key_codebook[codes]  # (num_groups, group_size)
@@ -429,6 +438,11 @@ class NormQuantizer:
         D_grouped = rotated_dim if rotated_dim % gs == 0 else rotated_dim + (gs - rotated_dim % gs)
         grouped_shape = (*rotated.shape[:-1], D_grouped)
 
+        # Ensure codebook/boundaries live on the same device as the data.
+        if self._value_boundaries.device != normalized.device:
+            self._value_boundaries = self._value_boundaries.to(normalized.device)
+            self._value_codebook = self._value_codebook.to(normalized.device)
+
         codes = torch.bucketize(normalized, self._value_boundaries)
         return {
             'codes': codes.to(torch.uint8),
@@ -447,6 +461,10 @@ class NormQuantizer:
         original_dim = qdata['original_dim']
         rotated_shape = qdata['rotated_shape']
         grouped_shape = qdata.get('grouped_shape', rotated_shape)
+
+        if self._value_codebook.device != codes.device:
+            self._value_codebook = self._value_codebook.to(codes.device)
+            self._value_boundaries = self._value_boundaries.to(codes.device)
 
         reconstructed = self._value_codebook[codes]
 
