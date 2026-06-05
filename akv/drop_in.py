@@ -609,7 +609,11 @@ class AKVLayer(_get_dynamic_layer_base()):
             # start with score 0 so they need to accumulate evidence before
             # being promoted (avoids immediate ping-pong after demote).
             if self._proxy_score is not None:
-                pad = torch.zeros(n_demote, dtype=self._proxy_score.dtype)
+                pad = torch.zeros(
+                    n_demote,
+                    dtype=self._proxy_score.dtype,
+                    device=self._proxy_score.device,
+                )
                 self._proxy_score = torch.cat([self._proxy_score, pad])
 
             # Remove demoted from hot (keep non-demoted)
