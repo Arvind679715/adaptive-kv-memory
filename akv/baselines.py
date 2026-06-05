@@ -402,6 +402,134 @@ class KIVICache(BaseKVCache):
         return total
 
 
+@dataclass
+class KIVIFusedConfig(KIVIConfig):
+    """Configuration for a fair, fused-style KIVI baseline.
+
+    Mirrors ``KIVIConfig`` but the cache implementation behaves like the
+    published fused INT4/INT2 kernel:
+
+    * Incremental quantization: overflow tokens are quantized once and
+      appended to the packed buffer; the existing packed cache is never
+      re-quantized (saves O(N \u00b7 group_size) reads/writes per step).
+    * Working dequantized copy: a single fp16 view is materialized once
+      on overflow and reused for attention reads. This matches the
+      cost profile of a fused dequant\u00d7matmul kernel, where dequant
+      is a one-time prefetch into shared memory, not a per-step pass.
+
+    Memory accounting still reports the *packed* bit-width cost, so the
+    apples-to-apples comparison against AKV is honest.
+    """
+
+    pass
+
+
+class KIVIFusedCache(KIVICache):
+    """Fused-style KIVI cache for a fair throughput comparison.
+
+    Why this exists: the naive ``KIVICache`` re-quantizes the entire
+    merged cache on every overflow and re-dequantizes the full cache on
+    every step. Published KIVI numbers come from a fused CUDA kernel
+    that does neither. Using the naive impl as a throughput baseline
+    against AKV inflates AKV's speedup advantage; this class closes
+    that gap by mimicking the fused kernel's cost profile.
+
+    See ``KIVIFusedConfig`` for the precise differences.
+    """
+
+    def __init__(self, config: Optional[KIVIFusedConfig] = None):
+        super().__init__(config or KIVIFusedConfig())
+        # Cached dequantized view per layer. Populated lazily on overflow
+        # and invalidated when new quantized data is appended.
+        self._dequant_keys_cache: dict[int, torch.Tensor] = {}
+        self._dequant_values_cache: dict[int, torch.Tensor] = {}
+
+    def _quantize_overflow(self, layer_idx: int):
+        """Incremental quantize: append new packed chunk, never re-quant existing."""
+        cfg = self.config
+        res_k = self._residual_keys[layer_idx]
+        res_v = self._residual_values[layer_idx]
+        res_len = res_k.shape[2]
+
+        n_to_quant = res_len - cfg.residual_length
+        to_quant_k = res_k[:, :, :n_to_quant, :]
+        to_quant_v = res_v[:, :, :n_to_quant, :]
+
+        new_qk = self._quantize_tensor(to_quant_k, cfg.key_bits, cfg.group_size)
+        new_qv = self._quantize_tensor(to_quant_v, cfg.value_bits, cfg.group_size)
+
+        if layer_idx in self._quant_keys:
+            self._quant_keys[layer_idx] = _concat_quant_chunks(
+                self._quant_keys[layer_idx], new_qk
+            )
+            self._quant_values[layer_idx] = _concat_quant_chunks(
+                self._quant_values[layer_idx], new_qv
+            )
+            # Extend the dequantized working copy by dequantizing only the
+            # NEW chunk and concatenating along the seq axis. This is what
+            # a fused kernel effectively pays: one small dequant per step.
+            new_k_fp16 = self._dequantize_tensor(new_qk)
+            new_v_fp16 = self._dequantize_tensor(new_qv)
+            self._dequant_keys_cache[layer_idx] = torch.cat(
+                [self._dequant_keys_cache[layer_idx], new_k_fp16], dim=2
+            )
+            self._dequant_values_cache[layer_idx] = torch.cat(
+                [self._dequant_values_cache[layer_idx], new_v_fp16], dim=2
+            )
+        else:
+            self._quant_keys[layer_idx] = new_qk
+            self._quant_values[layer_idx] = new_qv
+            self._dequant_keys_cache[layer_idx] = self._dequantize_tensor(new_qk)
+            self._dequant_values_cache[layer_idx] = self._dequantize_tensor(new_qv)
+
+        self._residual_keys[layer_idx] = res_k[:, :, n_to_quant:, :].contiguous()
+        self._residual_values[layer_idx] = res_v[:, :, n_to_quant:, :].contiguous()
+
+    def _get_full_kv(self, layer_idx: int):
+        """Read cached dequant view + residual \u2014 no per-step dequant pass."""
+        parts_k, parts_v = [], []
+
+        if layer_idx in self._dequant_keys_cache:
+            parts_k.append(self._dequant_keys_cache[layer_idx])
+            parts_v.append(self._dequant_values_cache[layer_idx])
+
+        parts_k.append(self._residual_keys[layer_idx])
+        parts_v.append(self._residual_values[layer_idx])
+
+        k = torch.cat(parts_k, dim=2) if len(parts_k) > 1 else parts_k[0]
+        v = torch.cat(parts_v, dim=2) if len(parts_v) > 1 else parts_v[0]
+        return k, v
+
+    def reset(self):
+        super().reset()
+        self._dequant_keys_cache.clear()
+        self._dequant_values_cache.clear()
+
+
+def _concat_quant_chunks(a: dict, b: dict) -> dict:
+    """Concatenate two packed quant dicts along the seq_len dimension.
+
+    Both dicts must come from ``KIVICache._quantize_tensor`` with the same
+    bits/group_size and matching trailing feature shape. We concat the
+    flattened packed buffers row-wise (each row = one (B,H,token)).
+    """
+    assert a["bits"] == b["bits"] and a["group_size"] == b["group_size"]
+    assert a["shape"][:2] == b["shape"][:2] and a["shape"][-1] == b["shape"][-1]
+    return {
+        "data": torch.cat([a["data"], b["data"]], dim=0),
+        "scales": torch.cat([a["scales"], b["scales"]], dim=0),
+        "zeros": torch.cat([a["zeros"], b["zeros"]], dim=0),
+        "shape": (
+            a["shape"][0],
+            a["shape"][1],
+            a["shape"][2] + b["shape"][2],
+            a["shape"][3],
+        ),
+        "bits": a["bits"],
+        "group_size": a["group_size"],
+    }
+
+
 # ============================================================
 # 4. SnapKV — Observation-Window Selection (Li et al., 2024)
 # ============================================================
@@ -910,6 +1038,8 @@ def create_baseline(name: str, **kwargs) -> BaseKVCache:
         return H2OCache(H2OConfig(**kwargs))
     elif name == "kivi":
         return KIVICache(KIVIConfig(**kwargs))
+    elif name in ("kivifused", "fusedkivi", "kiviincremental"):
+        return KIVIFusedCache(KIVIFusedConfig(**kwargs))
     elif name == "snapkv":
         return SnapKVCache(SnapKVConfig(**kwargs))
     elif name in ("scissorhands", "scissors"):
@@ -920,5 +1050,5 @@ def create_baseline(name: str, **kwargs) -> BaseKVCache:
         return PyramidKVCache(PyramidKVConfig(**kwargs))
     else:
         raise ValueError(f"Unknown baseline: {name}. "
-                        f"Choose from: full, h2o, kivi, snapkv, scissorhands, "
-                        f"streamingllm, pyramidkv")
+                        f"Choose from: full, h2o, kivi, kivi_fused, snapkv, "
+                        f"scissorhands, streamingllm, pyramidkv")

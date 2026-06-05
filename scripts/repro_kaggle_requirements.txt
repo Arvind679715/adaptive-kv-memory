@@ -1,0 +1,8 @@
+# Pinned dependencies for repro_kaggle.py
+# Generated alongside akv-cache==0.7.0 Kaggle artifacts (EXP15-EXP18).
+
+torch==2.4.0
+transformers==4.45.2
+datasets==3.0.1
+numpy==1.26.4
+akv-cache==0.7.0

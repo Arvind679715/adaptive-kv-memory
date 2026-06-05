@@ -37,7 +37,8 @@ from akv.cache import AdaptiveKVCache, CacheConfig
 from akv.integration import HFAdaptiveCache, HFProductionCache
 from akv.baselines import (
     FullCache, H2OCache, H2OConfig,
-    KIVICache, KIVIConfig, SnapKVCache, SnapKVConfig,
+    KIVICache, KIVIConfig, KIVIFusedCache, KIVIFusedConfig,
+    SnapKVCache, SnapKVConfig,
     ScissorHandsCache, ScissorHandsConfig,
     StreamingLLMCache, StreamingLLMConfig,
     PyramidKVCache, PyramidKVConfig,
@@ -91,7 +92,7 @@ __all__ = [
     "AdaptiveEvictor", "EvictionConfig",
     "HFAdaptiveCache",
     # Baselines
-    "FullCache", "H2OCache", "KIVICache", "SnapKVCache",
+    "FullCache", "H2OCache", "KIVICache", "KIVIFusedCache", "SnapKVCache",
     "ScissorHandsCache", "create_baseline",
     # Kernels
     "HAS_TRITON", "fused_quantized_attention",

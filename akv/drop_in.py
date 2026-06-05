@@ -152,6 +152,24 @@ class AKVLayer(_get_dynamic_layer_base()):
         enable_promotion: bool = True,
         promotion_threshold: float = 0.05,
         per_head_bits: Optional[list[int]] = None,
+        # ---- New: attention-free promotion ----
+        # When True, promotion can fire even without ``attention_weights``
+        # in cache_kwargs by using a key-similarity proxy:
+        #   score_i = EMA( <k_new, k_warm_i> / ||k_new|| ||k_warm_i|| )
+        # This is FA-compatible — it only needs the new K tensor the cache
+        # already receives in ``update()``. The proxy is a 1× matmul per
+        # decode step against the warm tier; cost is O(warm_len · d_head)
+        # which is dominated by the existing demote cost.
+        enable_promotion_proxy: bool = True,
+        proxy_decay: float = 0.7,
+        # ---- New: adaptive hot budget ----
+        # When > 0, hot_budget is dynamically resized at every update to
+        # ``max(hot_budget, int(adaptive_hot_frac * total_len))``. This
+        # fixes the RULER 4K–16K collapse where a fixed 512-token hot
+        # budget covers <15% of long contexts and needles get demoted
+        # at prefill before promotion has a chance to fire. Set to 0.25
+        # to enable the policy proposed in paper §7; default 0 (off).
+        adaptive_hot_frac: float = 0.0,
     ):
         # Initialise CacheLayerMixin/DynamicLayer state (self.keys=None,
         # self.values=None, self.is_initialized=False, etc.). Skip when the
@@ -171,6 +189,9 @@ class AKVLayer(_get_dynamic_layer_base()):
         self.protect = protect  # If True, keep all tokens at FP16
         self.enable_promotion = enable_promotion
         self.promotion_threshold = promotion_threshold
+        self.enable_promotion_proxy = enable_promotion_proxy
+        self.proxy_decay = proxy_decay
+        self.adaptive_hot_frac = adaptive_hot_frac
         # Per-head bit override from calibration. If set, the demotion path
         # quantizes each KV-head with its own bit-width instead of using the
         # single global `warm_bits` value.
@@ -194,6 +215,12 @@ class AKVLayer(_get_dynamic_layer_base()):
         # but a defensible one and far more honest than a closed-form
         # "theoretical" formula that ignores grouping overhead and padding.
         self._warm_bytes_packed: int = 0
+
+        # Attention-free promotion proxy: EMA of cosine similarity between
+        # the latest decode query (approximated by the most recent K tensor
+        # arriving at update()) and each warm token's stored K. Shape
+        # tracks ``self._warm_len``; resized on demote/promote.
+        self._proxy_score: Optional[torch.Tensor] = None
 
         # Importance scores for migration decisions
         self._importance: Optional[torch.Tensor] = None  # (N_hot,)
@@ -386,6 +413,99 @@ class AKVLayer(_get_dynamic_layer_base()):
                     promoted_scores = torch.ones(n_promote) * 2.0
                     self._importance = torch.cat([promoted_scores, self._importance])
 
+    def _update_proxy_score(self, key_states: torch.Tensor):
+        """Update the attention-free promotion proxy.
+
+        Computes cosine similarity between the most recent K and every
+        warm-tier K, then folds it into an EMA score per warm token.
+        This is the FlashAttention-compatible substitute for attention
+        weights: FA2/FA3 do not expose softmax(QK^T), so this proxy
+        gives promotion a signal it can act on without modifying the
+        attention kernel.
+
+        Cost: one matmul of shape (D,) x (warm_len, D) per layer per
+        decode step, dominated by the existing demote/dequant cost.
+        """
+        if self._warm_keys_fp16 is None or self._warm_keys_fp16.shape[2] == 0:
+            self._proxy_score = None
+            return
+
+        # Use the most recent key vector as a proxy for the current query
+        # direction. Mean over heads to get one direction per token, then
+        # mean over the new-token axis to collapse to a single (D,) probe.
+        # Shape: key_states (B, H, N, D) -> (D,).
+        probe = key_states.detach().float().mean(dim=(0, 1, 2))
+        probe = probe / (probe.norm() + 1e-6)
+
+        # Warm keys: (B, H, warm_len, D) -> per-token unit-norm in feature
+        # space, then dot with probe to get one similarity per warm token.
+        wk = self._warm_keys_fp16.detach().float()
+        wk_flat = wk.mean(dim=(0, 1))  # (warm_len, D)
+        wk_norm = wk_flat / (wk_flat.norm(dim=-1, keepdim=True) + 1e-6)
+        sim = wk_norm @ probe  # (warm_len,)
+
+        # EMA so a single high-similarity spike doesn't cause oscillation.
+        if (
+            self._proxy_score is None
+            or self._proxy_score.shape[0] != sim.shape[0]
+        ):
+            self._proxy_score = sim.abs()
+        else:
+            d = self.proxy_decay
+            self._proxy_score = d * self._proxy_score + (1 - d) * sim.abs()
+
+    def _promote_from_proxy(self):
+        """Attention-free promotion path.
+
+        Promotes the top-k warm tokens whose proxy score exceeds the
+        promotion threshold. Mirrors the bookkeeping of
+        ``_promote_from_warm`` so downstream tier state stays consistent.
+        """
+        if (
+            self._proxy_score is None
+            or self._warm_keys_fp16 is None
+            or self._warm_keys_fp16.shape[2] == 0
+            or self._hot_keys is None
+        ):
+            return
+
+        warm_len = self._warm_keys_fp16.shape[2]
+        if self._proxy_score.shape[0] != warm_len:
+            return  # bookkeeping mismatch, skip this step
+
+        # Threshold is on a 0-1 cosine scale; reuse promotion_threshold.
+        promote_mask = self._proxy_score > self.promotion_threshold
+        n_promote = int(promote_mask.sum().item())
+        if n_promote == 0:
+            return
+
+        max_promote = max(1, self.hot_budget // 8)
+        if n_promote > max_promote:
+            _, top_idx = self._proxy_score.topk(max_promote)
+            promote_mask = torch.zeros_like(promote_mask)
+            promote_mask[top_idx] = True
+            n_promote = max_promote
+
+        promote_idx = promote_mask.nonzero(as_tuple=True)[0]
+        promoted_k = self._warm_keys_fp16[:, :, promote_idx, :]
+        promoted_v = self._warm_values_fp16[:, :, promote_idx, :]
+
+        keep_mask = ~promote_mask
+        self._warm_keys_fp16 = self._warm_keys_fp16[:, :, keep_mask, :]
+        self._warm_values_fp16 = self._warm_values_fp16[:, :, keep_mask, :]
+        self._proxy_score = self._proxy_score[keep_mask]
+        if warm_len > 0:
+            keep_frac = max(0, warm_len - n_promote) / warm_len
+            self._warm_bytes_packed = int(self._warm_bytes_packed * keep_frac)
+        self._warm_len -= n_promote
+
+        self._hot_keys = torch.cat([promoted_k, self._hot_keys], dim=2)
+        self._hot_values = torch.cat([promoted_v, self._hot_values], dim=2)
+
+        if self._importance is not None:
+            promoted_scores = torch.ones(n_promote) * 2.0
+            self._importance = torch.cat([promoted_scores, self._importance])
+
     def update(
         self,
         key_states: torch.Tensor,   # (B, H, N, D)
@@ -429,14 +549,35 @@ class AKVLayer(_get_dynamic_layer_base()):
         hot_len = self._hot_keys.shape[2]
         self._update_importance(N, hot_len)
 
-        # Promotion: check if warm tokens are being re-accessed
+        # Update the attention-free proxy BEFORE promotion so we can act
+        # on this step's signal. Cheap: one matmul against the warm tier.
+        if self.enable_promotion_proxy:
+            self._update_proxy_score(key_states)
+
+        # Promotion: prefer real attention weights when the caller supplies
+        # them (eager attention path). Otherwise fall back to the cheap
+        # key-similarity proxy so promotion still fires under FlashAttention.
         if self.enable_promotion and cache_kwargs and "attention_weights" in cache_kwargs:
             self._promote_from_warm(cache_kwargs["attention_weights"])
-            hot_len = self._hot_keys.shape[2]  # May have grown from promotion
+            hot_len = self._hot_keys.shape[2]
+        elif self.enable_promotion and self.enable_promotion_proxy:
+            self._promote_from_proxy()
+            hot_len = self._hot_keys.shape[2]
+
+        # Adaptive hot-budget scaling: when enabled, the effective budget
+        # grows with total context so the hot tier never drops below a
+        # configured fraction of seen tokens. This addresses the RULER
+        # 4K-16K collapse where a fixed budget gets swamped by long input.
+        effective_budget = self.hot_budget
+        if self.adaptive_hot_frac > 0.0:
+            effective_budget = max(
+                self.hot_budget,
+                int(self.adaptive_hot_frac * self._total_len),
+            )
 
         # Migration: if hot exceeds budget, demote least-important to warm
-        if hot_len > self.hot_budget:
-            n_demote = hot_len - self.hot_budget
+        if hot_len > effective_budget:
+            n_demote = hot_len - effective_budget
             demote_idx = self._select_demote_indices(n_demote, hot_len)
 
             demote_k = self._hot_keys[:, :, demote_idx, :]
@@ -463,6 +604,13 @@ class AKVLayer(_get_dynamic_layer_base()):
                     [self._warm_values_fp16, demote_v], dim=2)
 
             self._warm_len += n_demote
+
+            # Keep _proxy_score in sync with the warm tier. New warm tokens
+            # start with score 0 so they need to accumulate evidence before
+            # being promoted (avoids immediate ping-pong after demote).
+            if self._proxy_score is not None:
+                pad = torch.zeros(n_demote, dtype=self._proxy_score.dtype)
+                self._proxy_score = torch.cat([self._proxy_score, pad])
 
             # Remove demoted from hot (keep non-demoted)
             keep_mask = torch.ones(hot_len, dtype=torch.bool)
@@ -627,6 +775,9 @@ class AKVCache(_get_dynamic_cache_base()):
         num_hidden_layers: Optional[int] = None,
         enable_promotion: bool = True,
         promotion_threshold: float = 0.05,
+        enable_promotion_proxy: bool = True,
+        proxy_decay: float = 0.7,
+        adaptive_hot_frac: float = 0.0,
     ):
         # Resolve preset vs explicit params
         if preset is not None:
@@ -651,6 +802,9 @@ class AKVCache(_get_dynamic_cache_base()):
         self.num_hidden_layers = num_hidden_layers
         self.enable_promotion = enable_promotion
         self.promotion_threshold = promotion_threshold
+        self.enable_promotion_proxy = enable_promotion_proxy
+        self.proxy_decay = proxy_decay
+        self.adaptive_hot_frac = adaptive_hot_frac
 
         # Resolve protected layers
         self._protect_first = protect_first
@@ -766,6 +920,9 @@ class AKVCache(_get_dynamic_cache_base()):
                 protect=self._is_protected(idx),
                 enable_promotion=self.enable_promotion,
                 promotion_threshold=self.promotion_threshold,
+                enable_promotion_proxy=self.enable_promotion_proxy,
+                proxy_decay=self.proxy_decay,
+                adaptive_hot_frac=self.adaptive_hot_frac,
                 per_head_bits=self._calibration_per_head_bits.get(idx)
                 if self._calibration_per_head_bits else None,
             ))
