@@ -811,14 +811,31 @@ class AKVCache(_get_dynamic_cache_base()):
                 layer._warm_values_fp16 = layer._warm_values_fp16.index_select(0, beam_idx)
 
     def memory_usage(self) -> dict:
-        """Aggregate memory stats across all layers."""
-        totals = {"hot_bytes": 0, "warm_bytes": 0, "total_bytes": 0,
-                  "fp16_equivalent_bytes": 0}
+        """Aggregate memory stats across all layers.
+
+        Sums every per-layer key from ``AKVLayer.memory_usage_bytes`` so
+        callers see the same honest packed-vs-live distinction the layer
+        reports. Cross-layer ``savings_ratio`` is recomputed from the
+        measured packed totals so a per-layer fluke can't skew the global
+        number.
+        """
+        per_layer_keys = (
+            "hot_bytes",
+            "warm_bytes",
+            "warm_bytes_live",
+            "warm_bytes_packed",
+            "warm_bytes_formula",
+            "total_bytes",
+            "fp16_equivalent_bytes",
+        )
+        totals = {k: 0 for k in per_layer_keys}
         for layer in self.layers:
             stats = layer.memory_usage_bytes()
-            for k in totals:
+            for k in per_layer_keys:
                 totals[k] += stats.get(k, 0)
-        totals["savings_ratio"] = totals["fp16_equivalent_bytes"] / max(totals["total_bytes"], 1)
+        totals["savings_ratio"] = (
+            totals["fp16_equivalent_bytes"] / max(totals["total_bytes"], 1)
+        )
         totals["num_layers"] = len(self.layers)
         return totals
 

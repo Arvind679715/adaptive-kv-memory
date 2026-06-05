@@ -608,11 +608,42 @@ class NormQuantWarmTier:
 
     @property
     def bytes_used(self) -> int:
+        """Honest packed byte count for the warm tier.
+
+        Counts: (a) the codes at their *actual* bit-width (so 4-bit
+        codes report 0.5 byte each, not 1), and (b) the per-group
+        mean/std side info at fp16. Mirrors
+        ``akv.drop_in.AKVLayer._warm_bytes_packed`` and
+        ``akv.packed_layout.PackedKVArena.bytes_used`` so a paper-grade
+        memory comparison is consistent across cache implementations.
+        """
         if self._len == 0:
             return 0
-        k_bytes = self._k_codes[:, :self._len].numel()  # uint8 = 1 byte each
-        v_bytes = self._v_codes[:, :self._len].numel()
-        return k_bytes + v_bytes
+        k_codes = self._k_codes[:, :self._len]
+        v_codes = self._v_codes[:, :self._len]
+        k_bits = self._quantizer.config.key_bits
+        v_bits = self._quantizer.config.value_bits
+        k_code_bytes = (k_codes.numel() * k_bits + 7) // 8
+        v_code_bytes = (v_codes.numel() * v_bits + 7) // 8
+        scale_bytes = (
+            self._k_mean[:, :self._len].nbytes
+            + self._k_std[:, :self._len].nbytes
+            + self._v_mean[:, :self._len].nbytes
+            + self._v_std[:, :self._len].nbytes
+        )
+        return k_code_bytes + v_code_bytes + scale_bytes
+
+    @property
+    def raw_uint8_bytes(self) -> int:
+        """Back-compat: the OLD (incorrect) accounting, kept only for
+        regression-style comparisons. Reports codes as 1 byte each and
+        ignores scale overhead. Do not use for new analysis."""
+        if self._len == 0:
+            return 0
+        return (
+            self._k_codes[:, :self._len].numel()
+            + self._v_codes[:, :self._len].numel()
+        )
 
     def reset(self):
         self._len = 0
