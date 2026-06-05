@@ -27,39 +27,59 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Lazy import to avoid hard dependency on specific transformers version
+# Lazy import to avoid hard dependency on specific transformers version.
+# We prefer subclassing DynamicLayer / DynamicCache so transformers-side
+# protocol changes (get_mask_sizes, lazy_initialization, etc.) are inherited
+# for free instead of re-implemented in this file.
 _DynamicCache = None
+_DynamicLayer = None
 _BaseCache = None
 
 
+def _resolve_bases():
+    """Resolve (DynamicCache, DynamicLayer) bases for the installed transformers.
+
+    Returns a (cache_base, layer_base) tuple. Both fall back to safe defaults
+    when transformers is absent so unit-tests can still import this module.
+    """
+    global _DynamicCache, _DynamicLayer, _BaseCache
+    if _DynamicCache is not None and _DynamicLayer is not None:
+        return _DynamicCache, _DynamicLayer
+
+    try:
+        from transformers.cache_utils import DynamicCache as _DC, DynamicLayer as _DL
+        _DynamicCache, _DynamicLayer = _DC, _DL
+    except ImportError:
+        # transformers < 4.46 has DynamicCache but no DynamicLayer.
+        try:
+            from transformers.cache_utils import DynamicCache as _DC
+            _DynamicCache = _DC
+        except ImportError:
+            class _FallbackCache:
+                def __init__(self):
+                    self.layers = []
+                def get_seq_length(self, layer_idx=0):
+                    return 0
+                def __len__(self):
+                    return len(self.layers)
+            _DynamicCache = _FallbackCache
+        _DynamicLayer = object  # no mixin available on older transformers
+
+    try:
+        from transformers import Cache as _CB
+        _BaseCache = _CB
+    except ImportError:
+        _BaseCache = _DynamicCache
+    return _DynamicCache, _DynamicLayer
+
+
 def _get_dynamic_cache_base():
-    global _DynamicCache, _BaseCache
-    if _DynamicCache is None:
-        try:
-            from transformers.cache_utils import DynamicCache
-            _DynamicCache = DynamicCache
-        except ImportError:
-            try:
-                from transformers import Cache
-                _DynamicCache = Cache
-            except ImportError:
-                # Fallback: define a minimal base that works without transformers
-                class _FallbackCache:
-                    def __init__(self):
-                        self.layers = []
-                    def get_seq_length(self, layer_idx=0):
-                        return 0
-                    def __len__(self):
-                        return len(self.layers)
-                _DynamicCache = _FallbackCache
-    # Also resolve _BaseCache for isinstance checks
-    if _BaseCache is None:
-        try:
-            from transformers import Cache
-            _BaseCache = Cache
-        except ImportError:
-            _BaseCache = _DynamicCache
-    return _DynamicCache
+    """Back-compat shim."""
+    return _resolve_bases()[0]
+
+
+def _get_dynamic_layer_base():
+    return _resolve_bases()[1]
 
 
 # =============================================================================
@@ -92,8 +112,16 @@ _PRESETS = {
 # AKVLayer — per-layer state
 # =============================================================================
 
-class AKVLayer:
+class AKVLayer(_get_dynamic_layer_base()):
     """Per-layer KV state with importance-aware tiered storage.
+
+    Subclasses ``transformers.cache_utils.DynamicLayer`` so the full
+    ``CacheLayerMixin`` contract (``get_mask_sizes``, ``get_seq_length``,
+    ``lazy_initialization``, ``get_max_cache_shape``, ``is_sliding``,
+    ``is_compileable``, ``reorder_cache``, ``reset``, etc.) is inherited
+    automatically. This means the layer keeps working when transformers
+    extends or tweaks the protocol — we only override what we genuinely
+    need to specialise.
 
     Unlike TinyKVLayer (which just has FP16 residual + quantized tail),
     AKVLayer has:
@@ -101,14 +129,18 @@ class AKVLayer:
     - Warm tier: older tokens at NormQuant 2-4 bit (actually compressed)
     - Importance tracking per token position
     - Promotion: warm tokens re-accessed get moved back to hot
+
+    Storage contract: ``self.keys`` / ``self.values`` hold the full
+    warm➚hot concatenated view (so the base class's ``get_seq_length``,
+    ``get_mask_sizes`` and legacy ``key_cache`` / ``value_cache`` accessors
+    just work). The tier-internal tensors (``_hot_*``, ``_warm_*_fp16``)
+    are the source of truth and are rebuilt into ``keys`` / ``values`` at
+    the end of every ``update()``.
     """
 
-    # transformers >= 4.46 inspects layer.is_compileable when deciding
-    # whether to use static-cache fast paths. AKVLayer is not torch.compile-
-    # friendly (dynamic tiers, Python-side dequant), so advertise False.
+    # Not torch.compile-friendly (dynamic tiers, Python-side dequant).
     is_compileable: bool = False
-    # transformers >= 4.46 reads is_sliding on each cache layer when building
-    # the attention mask. AKV never uses sliding attention.
+    # AKV never uses sliding attention; mask construction needs this attr.
     is_sliding: bool = False
 
     def __init__(
@@ -121,6 +153,18 @@ class AKVLayer:
         promotion_threshold: float = 0.05,
         per_head_bits: Optional[list[int]] = None,
     ):
+        # Initialise CacheLayerMixin/DynamicLayer state (self.keys=None,
+        # self.values=None, self.is_initialized=False, etc.). Skip when the
+        # base is plain ``object`` (transformers absent).
+        base = _get_dynamic_layer_base()
+        if base is not object:
+            try:
+                base.__init__(self)
+            except TypeError:
+                # Some older versions take a config arg; ignore failures.
+                self.keys = None
+                self.values = None
+                self.is_initialized = False
         self.warm_bits = warm_bits
         self.hot_budget = hot_budget
         self.group_size = group_size
@@ -329,6 +373,12 @@ class AKVLayer:
                 self._hot_keys = torch.cat([self._hot_keys, key_states], dim=2)
                 self._hot_values = torch.cat([self._hot_values, value_states], dim=2)
             self._total_len += N
+            # Keep base-class storage in sync (see contract note above).
+            self.keys = self._hot_keys
+            self.values = self._hot_values
+            self.dtype = self._hot_keys.dtype
+            self.device = self._hot_keys.device
+            self.is_initialized = True
             return self._hot_keys, self._hot_values
 
         # Normal path: append to hot
@@ -393,23 +443,22 @@ class AKVLayer:
             full_keys = self._hot_keys
             full_values = self._hot_values
 
+        # Mirror tier state into the base-class storage so that
+        # transformers' DynamicLayer.get_seq_length / get_mask_sizes and the
+        # legacy DynamicCache.key_cache / value_cache properties read the
+        # correct lengths and tensors.
+        self.keys = full_keys
+        self.values = full_values
+        self.dtype = full_keys.dtype
+        self.device = full_keys.device
+        self.is_initialized = True
+
         return full_keys, full_values
 
-    def get_seq_length(self) -> int:
-        return self._total_len
-
-    def get_mask_sizes(self, query_length: int) -> Tuple[int, int]:
-        """Required by CacheLayerMixin contract (transformers >= 4.46).
-
-        Returns (kv_length, kv_offset) where kv_length is the number of
-        cached KV positions (including the new query_length appended this
-        step) and kv_offset is the position of the first cached token.
-        """
-        return (self._total_len + query_length, 0)
-
-    def get_max_cache_shape(self) -> int:
-        """Unbounded cache (tiered compression handles capacity)."""
-        return -1
+    # get_seq_length, get_mask_sizes, get_max_cache_shape, lazy_initialization,
+    # reorder_cache, reset, offload, prefetch are all inherited from
+    # DynamicLayer / CacheLayerMixin. They read self.keys / self.values, which
+    # update() keeps in sync with the tier state.
 
     def memory_usage_bytes(self) -> dict:
         """Memory accounting.
@@ -547,20 +596,21 @@ class AKVCache(_get_dynamic_cache_base()):
                     )
                 self._protected_set.add(p)
 
-        # Per-layer caches (lazily created)
-        self.layers: list[AKVLayer] = []
+        # Initialize base class FIRST so all transformers-required attrs
+        # (layers list, layer_class_to_replicate, offloading flags, etc.) are
+        # set up before we layer our own state on top. Calling DynamicCache
+        # with no args takes its "lazy init" branch which is exactly what we
+        # want (we manage layer creation ourselves in update()).
+        base = _get_dynamic_cache_base()
+        if base is not object and hasattr(base, '__init__'):
+            super().__init__()
+
+        # Our own state on top of the base. self.layers was set to [] by
+        # super().__init__() above; we reuse that list directly.
         self._seen_tokens: int = 0
         # Optional per-(layer, head) bit assignment from `akv calibrate`.
         # Map layer_idx -> list[bits per KV-head]. Applied at layer creation.
         self._calibration_per_head_bits: dict[int, list[int]] = {}
-
-        # Initialize base class (DynamicCache or Cache)
-        base = _get_dynamic_cache_base()
-        if base is not object and hasattr(base, '__init__'):
-            try:
-                super().__init__()
-            except TypeError:
-                pass  # Fallback base doesn't need init args
 
     @classmethod
     def for_model(cls, model, **kwargs) -> "AKVCache":
@@ -712,38 +762,11 @@ class AKVCache(_get_dynamic_cache_base()):
         """Convert to tuple-of-tuples format for older transformers."""
         return tuple(self[i] for i in range(len(self.layers)))
 
-    def get_mask_sizes(self, query_length, layer_idx: int = 0):
-        """Return (kv_length, kv_offset) for transformers mask creation.
-
-        transformers >= 4.46 calls this as `cache.get_mask_sizes(query_length, layer_idx)`
-        with two positional ints. `query_length` is the number of NEW query tokens
-        being added this forward pass; kv_length is the total cache length AFTER
-        update (since update() is called before mask creation in modern code paths,
-        the layer already reflects the new tokens).
-
-        We also tolerate the legacy call style where a `cache_position` tensor
-        is passed first — older transformers used that signature.
-        """
-        # Legacy path: cache_position tensor
-        if isinstance(query_length, torch.Tensor) or (
-            hasattr(query_length, '__len__') and not isinstance(query_length, int)
-        ):
-            cache_position = query_length
-            kv_length = self.get_seq_length(layer_idx)
-            if len(cache_position) > 0:
-                last_pos = (cache_position[-1].item()
-                            if hasattr(cache_position[-1], 'item')
-                            else int(cache_position[-1]))
-                if last_pos >= kv_length:
-                    kv_length = last_pos + 1
-            return kv_length, 0
-
-        # Modern path: two ints. The layer's _total_len already includes the
-        # newly-appended tokens because update() runs before mask creation.
-        if layer_idx < len(self.layers):
-            return self.layers[layer_idx].get_seq_length(), 0
-        # Layer not yet created -> first prefill, kv_length == query_length
-        return int(query_length), 0
+    # get_mask_sizes is inherited from transformers.cache_utils.Cache, which
+    # dispatches to layer.get_mask_sizes(query_length). AKVLayer inherits
+    # that method from DynamicLayer so this Just Works on transformers >= 4.46.
+    # On older transformers (<= 4.45) the base class also provided a
+    # compatible signature; no override needed.
 
     @property
     def key_cache(self):

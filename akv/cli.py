@@ -152,6 +152,91 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
     print(f"Saved calibration to: {out}")
 
 
+def cmd_validate(args: argparse.Namespace) -> None:
+    """FP16-vs-AKV greedy-decode smoke test against a HuggingFace model.
+
+    Runs the same prompt through ``DynamicCache`` (FP16 baseline) and
+    ``AKVCache``, prints token-agreement %, generation text side-by-side,
+    and exits non-zero when agreement falls below ``--min-agreement``.
+
+    Intended for CI: a single command that catches HF Cache-API drift
+    before it ships.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+    from akv import AKVCache
+
+    device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
+    dtype = torch.float32 if device == "cpu" else torch.float16
+
+    print(f"Loading {args.model} on {device} ({dtype}) ...")
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, torch_dtype=dtype, trust_remote_code=True,
+    ).to(device).eval()
+
+    prompt = args.prompt
+    input_ids = tok(prompt, return_tensors="pt").input_ids.to(device)
+    input_len = input_ids.shape[1]
+
+    def _gen(cache):
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            out = model.generate(
+                input_ids, max_new_tokens=args.max_new_tokens,
+                do_sample=False, past_key_values=cache,
+                pad_token_id=tok.eos_token_id or 0,
+            )
+        return out[0, input_len:].tolist(), time.perf_counter() - t0
+
+    print("\n── FP16 baseline (DynamicCache) ──")
+    fp_ids, fp_t = _gen(DynamicCache())
+    fp_text = tok.decode(fp_ids, skip_special_tokens=True)
+    print(f"  {len(fp_ids)} tokens in {fp_t:.2f}s")
+    print(f"  Text: {fp_text[:200]}{'...' if len(fp_text) > 200 else ''}")
+
+    cache_kwargs = {}
+    if args.preset:
+        cache_kwargs["preset"] = args.preset
+    if args.warm_bits is not None:
+        cache_kwargs["warm_bits"] = args.warm_bits
+    if args.hot_budget is not None:
+        cache_kwargs["hot_budget"] = args.hot_budget
+    if not cache_kwargs:
+        cache_kwargs["preset"] = "quality"
+    cache_kwargs["num_hidden_layers"] = model.config.num_hidden_layers
+    cache_kwargs["enable_promotion"] = not args.no_promotion
+
+    desc = ", ".join(f"{k}={v!r}" for k, v in cache_kwargs.items()
+                     if k != "num_hidden_layers")
+    print(f"\n── AKVCache({desc}) ──")
+    akv_ids, akv_t = _gen(AKVCache(**cache_kwargs))
+    akv_text = tok.decode(akv_ids, skip_special_tokens=True)
+    print(f"  {len(akv_ids)} tokens in {akv_t:.2f}s")
+    print(f"  Text: {akv_text[:200]}{'...' if len(akv_text) > 200 else ''}")
+
+    max_len = max(len(fp_ids), len(akv_ids))
+    matches = sum(a == b for a, b in zip(fp_ids, akv_ids))
+    pct = 100.0 * matches / max(max_len, 1)
+    print(f"\n── Token agreement ──")
+    print(f"  Matching: {matches}/{max_len} ({pct:.1f}%)")
+    print(f"  Length match: {len(fp_ids) == len(akv_ids)}")
+
+    if pct >= 99.0:
+        verdict = "PERFECT — outputs are bit-exact or near-bit-exact"
+    elif pct >= 90.0:
+        verdict = "GOOD — minor divergence (expected for aggressive presets)"
+    elif pct >= 70.0:
+        verdict = "ACCEPTABLE — noticeable divergence, check quality"
+    else:
+        verdict = "FAIL — significant divergence; integration likely broken"
+    print(f"  Verdict: {verdict}")
+
+    if pct < args.min_agreement:
+        print(f"\nFAILED: agreement {pct:.1f}% < threshold {args.min_agreement:.1f}%")
+        sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="akv",
@@ -202,6 +287,28 @@ def main() -> None:
     cal_p.add_argument("--cpu", action="store_true",
                        help="Force CPU even if CUDA is available")
 
+    # validate
+    val_p = sub.add_parser(
+        "validate",
+        help="FP16-vs-AKV greedy-decode smoke test (catches Cache-API drift)",
+    )
+    val_p.add_argument("--model", type=str, required=True,
+                       help="HuggingFace model id (e.g. Qwen/Qwen2.5-0.5B-Instruct)")
+    val_p.add_argument("--prompt", type=str,
+                       default="Explain the difference between TCP and UDP in two sentences.",
+                       help="Prompt to decode with both caches")
+    val_p.add_argument("--max-new-tokens", type=int, default=64)
+    val_p.add_argument("--preset", choices=["quality", "balanced", "compact"], default=None,
+                       help="AKV preset (mutually exclusive with --warm-bits/--hot-budget)")
+    val_p.add_argument("--warm-bits", type=int, default=None)
+    val_p.add_argument("--hot-budget", type=int, default=None)
+    val_p.add_argument("--no-promotion", action="store_true",
+                       help="Disable warm->hot promotion (keeps run fully deterministic)")
+    val_p.add_argument("--min-agreement", type=float, default=80.0,
+                       help="Exit non-zero when token-agreement %% falls below this")
+    val_p.add_argument("--cpu", action="store_true",
+                       help="Force CPU even if CUDA is available")
+
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
@@ -213,6 +320,7 @@ def main() -> None:
         "info": cmd_info,
         "adapters": cmd_adapters,
         "calibrate": cmd_calibrate,
+        "validate": cmd_validate,
     }[args.command](args)
 
 
