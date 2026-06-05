@@ -23,11 +23,19 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.10", "3.11", "3.12"]
-        transformers: ["4.40.2", "4.45.2", "4.50.3", "latest"]
+        # 4.46 is the regression boundary where CacheLayerMixin landed and
+        # broke AKVLayer's hand-rolled get_mask_sizes signature — keep it
+        # pinned forever as a guard against future drift.
+        # 5.0 is the first major-version bump; "latest" tracks head.
+        transformers: ["4.40.2", "4.45.2", "4.46.3", "4.50.3", "5.0.0", "latest"]
         exclude:
           # transformers 4.40 dropped py3.12 wheels for some sub-deps
           - python: "3.12"
             transformers: "4.40.2"
+          # transformers 5.x requires py>=3.10 but we exclude py3.10 to keep
+          # the matrix size sensible — 4.50.3 already covers py3.10.
+          - python: "3.10"
+            transformers: "5.0.0"
 
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +74,16 @@ jobs:
         env:
           CUDA_VISIBLE_DEVICES: ""
           TOKENIZERS_PARALLELISM: "false"
-        run: pytest -x -q tests/ --ignore=tests/test_triton_ops.py --ignore=tests/test_turbo_quant.py -k "not cuda and not triton"
+        run: pytest -x -q tests/ --ignore=tests/test_triton_ops.py -k "not cuda and not triton"
+
+      - name: Bit-exact regression (drop-in contract)
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+          TOKENIZERS_PARALLELISM: "false"
+        # Run explicitly with verbose output so a failure here lights up
+        # immediately in the matrix UI — this is the single biggest defence
+        # against silent HF Cache-API drift.
+        run: pytest -v tests/test_bit_exact.py tests/test_packed_bytes.py
 
       - name: Smoke test drop-in cache (tiny model)
         env:
@@ -94,6 +111,25 @@ jobs:
               out2 = model(input_ids=new_ids, past_key_values=out.past_key_values, use_cache=True)
           print("OK: AKVCache compatible with transformers", __import__("transformers").__version__)
           PY
+
+      - name: akv validate (end-to-end CLI check)
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+          TOKENIZERS_PARALLELISM: "false"
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        # Exercise the production code path: model.generate(..., past_key_values=AKVCache())
+        # vs DynamicCache must agree on >=80%% of generated tokens. Uses the
+        # smallest published Qwen so the download stays under ~1.5 GB.
+        # Run on a single matrix cell to avoid pulling the model N times.
+        if: matrix.python == '3.12' && matrix.transformers == 'latest'
+        run: |
+          python -m akv.cli validate \
+            --model Qwen/Qwen2.5-0.5B \
+            --prompt "The capital of France is" \
+            --max-new-tokens 16 \
+            --preset balanced \
+            --min-agreement 80.0 \
+            --cpu
 
   # ============================================================
   # Build wheel + sdist on every commit (catches packaging bugs early).
