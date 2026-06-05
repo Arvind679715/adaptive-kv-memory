@@ -579,6 +579,14 @@ class AKVLayer(_get_dynamic_layer_base()):
         if hot_len > effective_budget:
             n_demote = hot_len - effective_budget
             demote_idx = self._select_demote_indices(n_demote, hot_len)
+            # _select_demote_indices uses _importance which lives on CPU
+            # (it's small and we never want to ship it to the GPU). Move
+            # the index tensor onto the hot/warm device before using it to
+            # gather KV slices — modern PyTorch is strict about advanced
+            # indexing with cross-device LongTensors.
+            _kv_device = self._hot_keys.device
+            if demote_idx.device != _kv_device:
+                demote_idx = demote_idx.to(_kv_device)
 
             demote_k = self._hot_keys[:, :, demote_idx, :]
             demote_v = self._hot_values[:, :, demote_idx, :]
@@ -609,6 +617,15 @@ class AKVLayer(_get_dynamic_layer_base()):
             # start with score 0 so they need to accumulate evidence before
             # being promoted (avoids immediate ping-pong after demote).
             if self._proxy_score is not None:
+                # Force both operands onto the warm-keys device. Without
+                # this, a stale CPU _proxy_score (e.g. left over from a
+                # CPU-only test fixture or an earlier run) cat'd with a
+                # CUDA pad will raise:
+                #   "Expected all tensors to be on the same device,
+                #    but got tensors is on cpu, different from cuda:0"
+                _ps_device = self._warm_keys_fp16.device
+                if self._proxy_score.device != _ps_device:
+                    self._proxy_score = self._proxy_score.to(_ps_device)
                 pad = torch.zeros(
                     n_demote,
                     dtype=self._proxy_score.dtype,
@@ -617,14 +634,14 @@ class AKVLayer(_get_dynamic_layer_base()):
                 self._proxy_score = torch.cat([self._proxy_score, pad])
 
             # Remove demoted from hot (keep non-demoted)
-            keep_mask = torch.ones(hot_len, dtype=torch.bool)
+            keep_mask = torch.ones(hot_len, dtype=torch.bool, device=_kv_device)
             keep_mask[demote_idx] = False
             self._hot_keys = self._hot_keys[:, :, keep_mask, :]
             self._hot_values = self._hot_values[:, :, keep_mask, :]
 
-            # Update importance array
+            # Update importance array (importance lives on CPU)
             if self._importance is not None:
-                self._importance = self._importance[keep_mask]
+                self._importance = self._importance[keep_mask.cpu()]
 
         # Build full view: warm + hot
         if self._warm_keys_fp16 is not None:
