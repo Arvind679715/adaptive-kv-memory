@@ -440,3 +440,94 @@ class PagedKVCache:
             page_table.clear()
         self._page_offsets = [0] * self.num_layers
         self._seq_lens = [0] * self.num_layers
+
+
+# =============================================================================
+# Bit-packing helpers
+#
+# These take a uint8 tensor of quantization indices (values in [0, 2**bits))
+# and return a smaller uint8 tensor where multiple indices share each byte.
+# Used by ``AKVLayer`` to report MEASURED (not formula-derived) warm-tier
+# byte usage in ``memory_usage_bytes``.
+#
+# Layout note: packing operates on the last dim. When the last dim is not a
+# clean multiple of the pack factor we pad on the right with zeros and
+# remember the original length for unpacking.
+# =============================================================================
+
+def pack_uint4(indices: torch.Tensor) -> torch.Tensor:
+    """Pack pairs of 4-bit indices into uint8 bytes (high nibble, low nibble)."""
+    if indices.shape[-1] % 2 != 0:
+        pad = 2 - (indices.shape[-1] % 2)
+        indices = torch.nn.functional.pad(indices, (0, pad))
+    high = (indices[..., 0::2].to(torch.uint8) & 0x0F) << 4
+    low = indices[..., 1::2].to(torch.uint8) & 0x0F
+    return high | low
+
+
+def pack_uint2(indices: torch.Tensor) -> torch.Tensor:
+    """Pack 4 2-bit indices into one byte."""
+    if indices.shape[-1] % 4 != 0:
+        pad = 4 - (indices.shape[-1] % 4)
+        indices = torch.nn.functional.pad(indices, (0, pad))
+    i = indices.to(torch.uint8) & 0x03
+    return (
+        (i[..., 0::4] << 6)
+        | (i[..., 1::4] << 4)
+        | (i[..., 2::4] << 2)
+        |  i[..., 3::4]
+    )
+
+
+def pack_uint3(indices: torch.Tensor) -> torch.Tensor:
+    """Pack 8 3-bit indices into 3 bytes (24 bits)."""
+    if indices.shape[-1] % 8 != 0:
+        pad = 8 - (indices.shape[-1] % 8)
+        indices = torch.nn.functional.pad(indices, (0, pad))
+    i = indices.to(torch.int32) & 0x07
+    g = i.reshape(*i.shape[:-1], -1, 8)
+    word = (
+        (g[..., 0] << 21) | (g[..., 1] << 18)
+        | (g[..., 2] << 15) | (g[..., 3] << 12)
+        | (g[..., 4] << 9)  | (g[..., 5] << 6)
+        | (g[..., 6] << 3)  |  g[..., 7]
+    )
+    b0 = ((word >> 16) & 0xFF).to(torch.uint8)
+    b1 = ((word >> 8) & 0xFF).to(torch.uint8)
+    b2 = (word & 0xFF).to(torch.uint8)
+    return torch.stack([b0, b1, b2], dim=-1).reshape(*i.shape[:-1], -1)
+
+
+def measure_packed_bytes(qdata: dict, bits: int) -> int:
+    """Return the on-disk byte size of a quantizer dict after bit-packing.
+
+    Walks ``qdata`` produced by ``TurboQuantizer.quantize_keys`` /
+    ``quantize_values`` and:
+
+    1. Bit-packs ``codes`` (uint8 indices) into the tightest layout for
+       the given bit-width (2/3/4 = packed; everything else = raw uint8).
+    2. Adds the size of all auxiliary tensors (``group_mean``,
+       ``group_std``) at their stored dtype (fp16 by default).
+
+    The returned int is the number of bytes a production cache would
+    actually keep in memory for this quantization event. Using this
+    instead of a closed-form formula gives honest, measured compression
+    numbers in ``AKVLayer.memory_usage_bytes``.
+    """
+    if 'codes' not in qdata:
+        return 0
+    codes = qdata['codes']
+    if bits == 4:
+        packed = pack_uint4(codes)
+    elif bits == 3:
+        packed = pack_uint3(codes)
+    elif bits == 2:
+        packed = pack_uint2(codes)
+    else:
+        packed = codes
+    total = packed.element_size() * packed.numel()
+    for key in ('group_mean', 'group_std', 'scale', 'zero'):
+        t = qdata.get(key)
+        if isinstance(t, torch.Tensor):
+            total += t.element_size() * t.numel()
+    return int(total)

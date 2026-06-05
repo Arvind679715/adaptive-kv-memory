@@ -186,6 +186,15 @@ class AKVLayer(_get_dynamic_layer_base()):
         self._warm_len: int = 0
         self._total_len: int = 0
 
+        # Honest packed-byte accounting. This counter is incremented every
+        # time we demote tokens to the warm tier, using the *measured* size
+        # of the bit-packed quantizer output (see
+        # ``packed_layout.measure_packed_bytes``). On promotion we scale it
+        # down by the fraction of warm tokens removed — an approximation,
+        # but a defensible one and far more honest than a closed-form
+        # "theoretical" formula that ignores grouping overhead and padding.
+        self._warm_bytes_packed: int = 0
+
         # Importance scores for migration decisions
         self._importance: Optional[torch.Tensor] = None  # (N_hot,)
         self._decay: float = 0.3
@@ -220,13 +229,19 @@ class AKVLayer(_get_dynamic_layer_base()):
                     self._quantizer_pool[b] = self._make_quantizer(b)
 
     def _quantize_per_head(self, k: torch.Tensor, v: torch.Tensor
-                           ) -> tuple[torch.Tensor, torch.Tensor]:
+                           ) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Quantize K/V slice (B, H, N, D) with per-head bit-widths.
 
         Falls back to the global quantizer when per_head_bits is unset or the
         head count mismatches. Always returns FP16 (dequantized) tensors so
-        downstream attention paths stay unchanged.
+        downstream attention paths stay unchanged, plus the *measured*
+        packed-byte count for the K+V pair (see
+        ``packed_layout.measure_packed_bytes``). The packed bytes are what
+        a production cache would actually hold in memory; the fp16 tensors
+        are a working copy this prototype keeps for cheap attention concat.
         """
+        from akv.packed_layout import measure_packed_bytes
+
         if (
             not self.per_head_bits
             or self._quantizer is None
@@ -234,18 +249,27 @@ class AKVLayer(_get_dynamic_layer_base()):
         ):
             qk = self._quantizer.quantize_keys(k.squeeze(0))
             qv = self._quantizer.quantize_values(v.squeeze(0))
+            packed_bytes = (
+                measure_packed_bytes(qk, self.warm_bits)
+                + measure_packed_bytes(qv, self.warm_bits)
+            )
             return (
                 self._quantizer.dequantize_keys(qk).unsqueeze(0),
                 self._quantizer.dequantize_values(qv).unsqueeze(0),
+                packed_bytes,
             )
 
         out_k = torch.empty_like(k)
         out_v = torch.empty_like(v)
+        packed_bytes = 0
         for h, bits in enumerate(self.per_head_bits):
             qz = self._quantizer_pool.get(bits) or self._quantizer
             if qz is None:
                 out_k[:, h] = k[:, h]
                 out_v[:, h] = v[:, h]
+                # No quantization happened — this head costs fp16.
+                packed_bytes += k[:, h].element_size() * k[:, h].numel()
+                packed_bytes += v[:, h].element_size() * v[:, h].numel()
                 continue
             # Quantize this head only: shape (B, N, D) -> (1, N, D) view
             kh = k[:, h:h+1].squeeze(0)
@@ -255,11 +279,15 @@ class AKVLayer(_get_dynamic_layer_base()):
                 qvh = qz.quantize_values(vh)
                 out_k[:, h] = qz.dequantize_keys(qkh).squeeze(0)
                 out_v[:, h] = qz.dequantize_values(qvh).squeeze(0)
+                packed_bytes += measure_packed_bytes(qkh, bits)
+                packed_bytes += measure_packed_bytes(qvh, bits)
             except Exception:
                 # Robust fallback: passthrough on per-head failure
                 out_k[:, h] = k[:, h]
                 out_v[:, h] = v[:, h]
-        return out_k, out_v
+                packed_bytes += k[:, h].element_size() * k[:, h].numel()
+                packed_bytes += v[:, h].element_size() * v[:, h].numel()
+        return out_k, out_v, packed_bytes
 
     def _update_importance(self, n_new: int, hot_len: int):
         """Update importance scores using recency decay.
@@ -342,6 +370,11 @@ class AKVLayer(_get_dynamic_layer_base()):
                 keep_mask = ~promote_mask
                 self._warm_keys_fp16 = self._warm_keys_fp16[:, :, keep_mask, :]
                 self._warm_values_fp16 = self._warm_values_fp16[:, :, keep_mask, :]
+                # Scale packed-byte counter by the fraction of tokens that
+                # remain (approximation: assumes uniform per-token cost).
+                if warm_len > 0:
+                    keep_frac = max(0, warm_len - n_promote) / warm_len
+                    self._warm_bytes_packed = int(self._warm_bytes_packed * keep_frac)
                 self._warm_len -= n_promote
 
                 # Insert at beginning of hot (they're important now)
@@ -409,9 +442,15 @@ class AKVLayer(_get_dynamic_layer_base()):
             demote_k = self._hot_keys[:, :, demote_idx, :]
             demote_v = self._hot_values[:, :, demote_idx, :]
 
-            # Actually quantize with NormQuant (no calibration needed)
+            # Actually quantize with NormQuant (no calibration needed).
+            # Returns dequantized fp16 (kept as a working copy for cheap
+            # attention concat) plus the *measured* packed-byte cost.
+            packed_event_bytes = 0
             if self._quantizer is not None:
-                demote_k, demote_v = self._quantize_per_head(demote_k, demote_v)
+                demote_k, demote_v, packed_event_bytes = self._quantize_per_head(
+                    demote_k, demote_v
+                )
+            self._warm_bytes_packed += packed_event_bytes
 
             # Append to warm tier
             if self._warm_keys_fp16 is None:
@@ -461,40 +500,86 @@ class AKVLayer(_get_dynamic_layer_base()):
     # update() keeps in sync with the tier state.
 
     def memory_usage_bytes(self) -> dict:
-        """Memory accounting.
+        """Per-layer memory accounting with three flavours of warm-tier cost.
 
-        Reports the *effective* memory: hot tier at fp16 cost,
-        warm tier at its quantized bit-width (even though we cache a
-        dequantized fp16 view for fast attention concat).
+        Returned dict keys:
 
-        In a production paged system, warm storage IS packed integers.
-        This reports what that would cost.
+        ``hot_bytes``
+            Live fp16 bytes held in the hot tier (always the actual cost).
+
+        ``warm_bytes_live``
+            What this prototype actually keeps resident for the warm tier.
+            Because we hold a dequantized fp16 working copy alongside the
+            packed representation, this is currently fp16-sized. A production
+            cache would not keep this and would pay ``warm_bytes_packed``.
+
+        ``warm_bytes_packed``
+            *Measured* packed-byte cost: accumulated at every demote event
+            from the actual ``packed_layout.measure_packed_bytes`` call on
+            the quantizer's output. This is the honest number to compare
+            against an FP16 baseline. Scaled down proportionally during
+            promotion (approximation, but defensible).
+
+        ``warm_bytes_formula``
+            Closed-form estimate that ignores grouping overhead and padding.
+            Kept for back-compat with older paper tables; prefer
+            ``warm_bytes_packed`` for new measurements.
+
+        ``warm_bytes``
+            Alias of ``warm_bytes_packed`` so legacy callers keep working.
+
+        ``total_bytes``
+            ``hot_bytes + warm_bytes_packed`` — the production-realistic
+            total.
+
+        ``fp16_equivalent_bytes``
+            What the full cache would cost at fp16, for the savings ratio.
+
+        ``savings_ratio``
+            ``fp16_equivalent_bytes / total_bytes``.
         """
-        hot_bytes = 0
         H = 1
         D = 128
+        hot_bytes = 0
         if self._hot_keys is not None:
-            hot_bytes = (self._hot_keys.nelement() + self._hot_values.nelement()) * 2
+            hot_bytes = (
+                self._hot_keys.element_size() * self._hot_keys.numel()
+                + self._hot_values.element_size() * self._hot_values.numel()
+            )
             H = self._hot_keys.shape[1]
             D = self._hot_keys.shape[3]
 
-        # Warm: effective size at quantized bitwidth
-        # Each element uses warm_bits / 8 bytes + small overhead for scales/zeros
-        warm_bytes = 0
+        # Live warm cost: actual fp16 working copy resident now.
+        warm_bytes_live = 0
+        if self._warm_keys_fp16 is not None:
+            warm_bytes_live = (
+                self._warm_keys_fp16.element_size() * self._warm_keys_fp16.numel()
+                + self._warm_values_fp16.element_size() * self._warm_values_fp16.numel()
+            )
+
+        # Measured packed cost (accumulated from real packing at demote).
+        warm_bytes_packed = int(self._warm_bytes_packed)
+
+        # Closed-form formula, kept for back-compat with prior paper numbers.
+        warm_bytes_formula = 0
         if self._warm_len > 0:
-            elements_per_kv = H * D  # per token
-            # bits per element + ~2 bytes per group for scales
+            elements_per_kv = H * D
             bits_per_element = self.warm_bits
             groups_per_token = (D + self.group_size - 1) // self.group_size
-            scale_bytes_per_token = groups_per_token * H * 4  # fp16 scale + zero
+            scale_bytes_per_token = groups_per_token * H * 4
             data_bytes_per_token = (elements_per_kv * bits_per_element + 7) // 8
-            warm_bytes = self._warm_len * (data_bytes_per_token + scale_bytes_per_token) * 2  # K+V
+            warm_bytes_formula = (
+                self._warm_len * (data_bytes_per_token + scale_bytes_per_token) * 2
+            )
 
-        total = hot_bytes + warm_bytes
-        fp16_equiv = self._total_len * H * D * 2 * 2  # K+V at fp16
+        total = hot_bytes + warm_bytes_packed
+        fp16_equiv = self._total_len * H * D * 2 * 2
         return {
             "hot_bytes": hot_bytes,
-            "warm_bytes": warm_bytes,
+            "warm_bytes": warm_bytes_packed,  # legacy key, now = measured packed
+            "warm_bytes_live": warm_bytes_live,
+            "warm_bytes_packed": warm_bytes_packed,
+            "warm_bytes_formula": warm_bytes_formula,
             "total_bytes": total,
             "fp16_equivalent_bytes": fp16_equiv,
             "savings_ratio": fp16_equiv / max(total, 1),
