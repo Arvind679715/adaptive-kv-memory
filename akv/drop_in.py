@@ -222,6 +222,16 @@ class AKVLayer(_get_dynamic_layer_base()):
         # tracks ``self._warm_len``; resized on demote/promote.
         self._proxy_score: Optional[torch.Tensor] = None
 
+        # Per-slot chronological position ids. These are CRITICAL: SDPA's
+        # slot-based causal mask assumes the K/V returned from ``update()``
+        # are in chronological order. Demote splits the cache into two
+        # tiers and re-concatenates [warm, hot]; without these arrays we
+        # would have no way to restore the original token order before
+        # returning. Both live on CPU (small LongTensor, index ops only)
+        # and are moved to the KV device only when used to gather slices.
+        self._hot_positions: Optional[torch.Tensor] = None   # (N_hot,)
+        self._warm_positions: Optional[torch.Tensor] = None  # (N_warm,)
+
         # Importance scores for migration decisions
         self._importance: Optional[torch.Tensor] = None  # (N_hot,)
         self._decay: float = 0.3
@@ -392,11 +402,20 @@ class AKVLayer(_get_dynamic_layer_base()):
                 # Move promoted tokens from warm to hot
                 promoted_k = self._warm_keys_fp16[:, :, promote_idx, :]
                 promoted_v = self._warm_values_fp16[:, :, promote_idx, :]
+                # Snapshot promoted positions for hot bookkeeping below.
+                promote_idx_cpu = promote_idx.detach().to('cpu')
+                promoted_positions = (
+                    self._warm_positions[promote_idx_cpu]
+                    if self._warm_positions is not None
+                    else None
+                )
 
                 # Remove from warm
                 keep_mask = ~promote_mask
                 self._warm_keys_fp16 = self._warm_keys_fp16[:, :, keep_mask, :]
                 self._warm_values_fp16 = self._warm_values_fp16[:, :, keep_mask, :]
+                if self._warm_positions is not None:
+                    self._warm_positions = self._warm_positions[keep_mask.detach().to('cpu')]
                 # Scale packed-byte counter by the fraction of tokens that
                 # remain (approximation: assumes uniform per-token cost).
                 if warm_len > 0:
@@ -407,6 +426,10 @@ class AKVLayer(_get_dynamic_layer_base()):
                 # Insert at beginning of hot (they're important now)
                 self._hot_keys = torch.cat([promoted_k, self._hot_keys], dim=2)
                 self._hot_values = torch.cat([promoted_v, self._hot_values], dim=2)
+                if promoted_positions is not None and self._hot_positions is not None:
+                    self._hot_positions = torch.cat(
+                        [promoted_positions, self._hot_positions]
+                    )
 
                 # Update importance: promoted tokens get high score
                 if self._importance is not None:
@@ -489,11 +512,19 @@ class AKVLayer(_get_dynamic_layer_base()):
         promote_idx = promote_mask.nonzero(as_tuple=True)[0]
         promoted_k = self._warm_keys_fp16[:, :, promote_idx, :]
         promoted_v = self._warm_values_fp16[:, :, promote_idx, :]
+        promote_idx_cpu = promote_idx.detach().to('cpu')
+        promoted_positions = (
+            self._warm_positions[promote_idx_cpu]
+            if self._warm_positions is not None
+            else None
+        )
 
         keep_mask = ~promote_mask
         self._warm_keys_fp16 = self._warm_keys_fp16[:, :, keep_mask, :]
         self._warm_values_fp16 = self._warm_values_fp16[:, :, keep_mask, :]
         self._proxy_score = self._proxy_score[keep_mask]
+        if self._warm_positions is not None:
+            self._warm_positions = self._warm_positions[keep_mask.detach().to('cpu')]
         if warm_len > 0:
             keep_frac = max(0, warm_len - n_promote) / warm_len
             self._warm_bytes_packed = int(self._warm_bytes_packed * keep_frac)
@@ -501,6 +532,10 @@ class AKVLayer(_get_dynamic_layer_base()):
 
         self._hot_keys = torch.cat([promoted_k, self._hot_keys], dim=2)
         self._hot_values = torch.cat([promoted_v, self._hot_values], dim=2)
+        if promoted_positions is not None and self._hot_positions is not None:
+            self._hot_positions = torch.cat(
+                [promoted_positions, self._hot_positions]
+            )
 
         if self._importance is not None:
             promoted_scores = torch.ones(n_promote) * 2.0
@@ -517,14 +552,23 @@ class AKVLayer(_get_dynamic_layer_base()):
         device = key_states.device
         self._ensure_quantizer(D, device)
 
+        # Track chronological position ids for the N freshly-arrived
+        # tokens. Computed BEFORE _total_len bumps so the ids span the
+        # correct half-open range [old_total_len, old_total_len + N).
+        new_positions = torch.arange(
+            self._total_len, self._total_len + N, dtype=torch.long
+        )
+
         # Protected layers: just accumulate FP16
         if self.protect:
             if self._hot_keys is None:
                 self._hot_keys = key_states
                 self._hot_values = value_states
+                self._hot_positions = new_positions
             else:
                 self._hot_keys = torch.cat([self._hot_keys, key_states], dim=2)
                 self._hot_values = torch.cat([self._hot_values, value_states], dim=2)
+                self._hot_positions = torch.cat([self._hot_positions, new_positions])
             self._total_len += N
             # Keep base-class storage in sync (see contract note above).
             self.keys = self._hot_keys
@@ -538,9 +582,11 @@ class AKVLayer(_get_dynamic_layer_base()):
         if self._hot_keys is None:
             self._hot_keys = key_states
             self._hot_values = value_states
+            self._hot_positions = new_positions
         else:
             self._hot_keys = torch.cat([self._hot_keys, key_states], dim=2)
             self._hot_values = torch.cat([self._hot_values, value_states], dim=2)
+            self._hot_positions = torch.cat([self._hot_positions, new_positions])
 
         self._total_len += N
         self._step += 1
@@ -591,6 +637,13 @@ class AKVLayer(_get_dynamic_layer_base()):
             demote_k = self._hot_keys[:, :, demote_idx, :]
             demote_v = self._hot_values[:, :, demote_idx, :]
 
+            # Snapshot the chronological positions of the demoted tokens
+            # so we can stitch them back into the right slots when we
+            # build the full view. Indexing on CPU keeps the position
+            # array on its native device.
+            demote_idx_cpu = demote_idx.detach().to('cpu')
+            demote_positions = self._hot_positions[demote_idx_cpu]
+
             # Actually quantize with NormQuant (no calibration needed).
             # Returns dequantized fp16 (kept as a working copy for cheap
             # attention concat) plus the *measured* packed-byte cost.
@@ -605,11 +658,14 @@ class AKVLayer(_get_dynamic_layer_base()):
             if self._warm_keys_fp16 is None:
                 self._warm_keys_fp16 = demote_k
                 self._warm_values_fp16 = demote_v
+                self._warm_positions = demote_positions
             else:
                 self._warm_keys_fp16 = torch.cat(
                     [self._warm_keys_fp16, demote_k], dim=2)
                 self._warm_values_fp16 = torch.cat(
                     [self._warm_values_fp16, demote_v], dim=2)
+                self._warm_positions = torch.cat(
+                    [self._warm_positions, demote_positions])
 
             self._warm_len += n_demote
 
@@ -639,14 +695,34 @@ class AKVLayer(_get_dynamic_layer_base()):
             self._hot_keys = self._hot_keys[:, :, keep_mask, :]
             self._hot_values = self._hot_values[:, :, keep_mask, :]
 
+            # Shrink position bookkeeping in lockstep with hot K/V.
+            keep_mask_cpu = keep_mask.cpu()
+            self._hot_positions = self._hot_positions[keep_mask_cpu]
+
             # Update importance array (importance lives on CPU)
             if self._importance is not None:
-                self._importance = self._importance[keep_mask.cpu()]
+                self._importance = self._importance[keep_mask_cpu]
 
-        # Build full view: warm + hot
+        # Build full view: warm + hot, then RESTORE CHRONOLOGICAL ORDER.
+        #
+        # Why this matters: SDPA's causal mask is slot-based — query at
+        # slot i is allowed to attend to keys at slots [0..i]. If the
+        # returned K/V are not in chronological position order, the mask
+        # leaks future tokens into past queries (or, equivalently, hides
+        # past tokens from future queries). On Qwen-1.5B prefill this
+        # produced PPL ~ 24000 vs ~ 12 for the same input through
+        # DynamicCache. Sorting by ``_*_positions`` is the actual fix.
         if self._warm_keys_fp16 is not None:
             full_keys = torch.cat([self._warm_keys_fp16, self._hot_keys], dim=2)
             full_values = torch.cat([self._warm_values_fp16, self._hot_values], dim=2)
+            full_positions = torch.cat(
+                [self._warm_positions, self._hot_positions]
+            )
+            sort_idx = full_positions.argsort()
+            if sort_idx.device != full_keys.device:
+                sort_idx = sort_idx.to(full_keys.device)
+            full_keys = full_keys.index_select(2, sort_idx)
+            full_values = full_values.index_select(2, sort_idx)
         else:
             full_keys = self._hot_keys
             full_values = self._hot_values
