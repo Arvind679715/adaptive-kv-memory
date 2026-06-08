@@ -244,7 +244,21 @@ class AKVLayer(_get_dynamic_layer_base()):
         self._quantizer_pool: dict[int, object] = {}
 
     def _make_quantizer(self, bits: int):
-        """Construct a TurboQuantizer at a given bit-width, or None."""
+        """Construct quantizer at a given bit-width, or None.
+
+        Uses the block-affine quantizer (KIVI-style) by default for
+        robust low-bit quality. Falls back to TurboQuantizer only if
+        AffineQuantizer is unavailable.
+        """
+        try:
+            from akv.affine_quantizer import AffineQuantizer, AffineQuantConfig
+            return AffineQuantizer(AffineQuantConfig(
+                key_bits=bits,
+                value_bits=bits,
+                group_size=self.group_size,
+            ))
+        except ImportError:
+            pass
         try:
             from akv.turbo_quant import TurboQuantizer, TurboQuantConfig
             return TurboQuantizer(TurboQuantConfig(
