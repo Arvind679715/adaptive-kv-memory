@@ -18,29 +18,30 @@
 
 ## Abstract
 
-We introduce **Adaptive KV Memory (AKV)**, a hierarchical KV cache management engine that enables 10x longer context inference with <2% perplexity degradation. Unlike eviction-based approaches (H2O, ScissorHands) that permanently discard tokens, AKV organizes the cache into three tiers — **hot** (GPU/FP16), **warm** (GPU/INT4), and **cold** (CPU/INT2) — with dynamic token migration based on attention-derived importance scores. Our fused Triton kernels perform exact mixed-precision attention across tiers without materializing dequantized tensors, providing both memory efficiency and mathematical correctness.
+We introduce **Adaptive KV Memory (AKV)**, a hierarchical KV cache management system that frames the KV cache as a virtual memory problem. Unlike eviction-based approaches (H2O, ScissorHands) that permanently discard tokens, AKV organizes the cache into three tiers — **hot** (GPU/FP16), **warm** (GPU/quantized), and **cold** (CPU/INT2) — with bidirectional migration based on attention-derived importance scores. The warm tier uses **block-affine quantization** (per-channel keys, per-token values) which preserves the channel structure critical for attention quality at 3–4 bits.
 
-**Key results on Llama-2-7B:**
-- **75% VRAM reduction** at 16K context with PPL ratio ≤ 1.02
-- **92% passkey retrieval** at 5% context depth (vs 12% for H2O)
-- **32K+ context** on a single 24GB GPU (baseline OOMs at 16K)
-- **Fused attention kernels** that avoid materializing 2GB+ of dequantized KV cache
+**Key results on Qwen2.5-1.5B:**
+- **3-bit warm tier adds only +3.1% PPL** over no-quantization baseline (8.83 vs 8.56)
+- **99.6% passkey retrieval** at all context depths (vs 37% for H2O mid-context)
+- **10.4× decode throughput** at 32K context while retaining 100% of tokens
+- **Importance-based demotion** beats FIFO at both 4-bit (+0.97%) and 2-bit (+8.08%)
 
 ## Key Features
 
-- **Zero-calibration quantization** — NormQuant ships pre-computed Gaussian codebooks. No calibration pass needed.
+- **Block-affine quantization** — KIVI-style per-channel K / per-token V scaling. Zero calibration, no rotation, no codebook.
 - **Plug-and-play** — `AKVCache(preset="balanced")` works with *any* HuggingFace model. No model surgery.
 - **Three presets** — `quality` (4-bit), `balanced` (3-bit), `compact` (2-bit) for different memory/quality tradeoffs.
-- **OpenAI-compatible server** — `akv-server` for instant deployment with chat completions API.
-- **Model diagnostics** — `diagnose_model()` auto-recommends the optimal preset for your model.
+- **Importance-based migration** — attention-derived scoring replaces FIFO, with measured PPL gains.
 - **DynamicCache subclass** — fully compatible with beam search, `generate()`, and all HF generation strategies.
+- **O(1) decode scaling** — bounded working set gives constant throughput regardless of total context.
 
-## What's New in v1.2.0
+## What's New in v1.3.0
 
-- **Per-head calibration pipeline** — `akv calibrate` produces a JSON report; `AKVCache.from_calibration()` assigns each KV-head its own bit-width (2/3/4) to hit a target average budget.
-- **Model adapter registry** — 12 families supported out of the box (Llama, TinyLlama, Mistral/Mixtral with SWA, Qwen2, Gemma/Gemma-2, Phi-3, GPT-2, OPT, BLOOM). Inspect with `akv adapters --verbose`.
-- **vLLM upstream-ready shim** — `from akv.vllm_backend import create_akv_llm` matches the proposed `LLM(kv_cache_backend="akv")` API. See [docs/vllm_pr.md](docs/vllm_pr.md).
-- **CI matrix** — tested on Python 3.10/3.11/3.12 × transformers 4.40 → latest.
+- **Block-affine quantizer** (`AffineQuantizer`) — replaces rotation-based TurboQuantizer as default warm-tier quantizer. Per-channel asymmetric for keys, per-token asymmetric for values. Fixes catastrophic 3-bit PPL regression (17,348 → 8.83).
+- **Negative result documented** — Hadamard rotation + codebook quantization (TurboQuant-style) catastrophically fails on K/V tensors at 3-bit. Rotation spreads channel outliers → softmax exponentiates errors.
+- **Component triage validated** — D/E/F configs isolate each system component. Demotion logic adds +0.05% PPL; 3-bit quantization adds +3.1%. No cliff effects.
+- **Production stability** — chronological K/V order preserved through demote/promote, device safety for Kaggle T4, transformers ≥4.46 CacheLayerMixin support.
+- **Honest memory accounting** — `packed_layout.measure_packed_bytes` reports real bit-packed sizes, not theoretical formulas.
 
 ## Motivation
 
@@ -129,15 +130,28 @@ The benefit scales with quantization aggressiveness — when compression noise i
 
 ---
 
+### Quantizer Triage (Qwen2.5-1.5B, 5K context)
+
+| Config | Description | PPL | Δ vs no-quant |
+|--------|------------|-----|---------------|
+| D | AKV, hot only (never demotes) | 8.56 | — |
+| E | AKV, 8-bit warm + demote | 8.56 | +0.05% |
+| F | AKV, 4-bit warm + demote | 8.64 | +0.9% |
+| **A** | **AKV, 3-bit warm + demote** | **8.83** | **+3.1%** |
+| — | Rotation + codebook 3-bit | 17,348 | +202,500% |
+
+Block-affine quantization at 3-bit adds only 3.1% PPL. Rotation-based quantizers destroy attention entirely.
+
+---
+
 ### Memory Capacity (Max Context on 16GB GPU)
 
-| Model | FP16 | KIVI 4b | AKV 4b | NormQuant 3b |
-|-------|------|---------|--------|--------------|
+| Model | FP16 | KIVI 4b | AKV 4b | AKV 3b |
 | TinyLlama-1.1B | 92K | 370K | 350K | 425K |
 | Llama-2-7B | 1.5K | 6K | 5.7K | 6.9K |
 | Llama-2-13B (4-bit model) | 2.8K | 11K | 10.5K | 12.8K |
 
-Quantization-based KV compression extends achievable context by **3–5×**.
+Block-affine quantization at 3-bit extends achievable context by **4–5×**.
 
 ### Delayed Recall (Passkey Retrieval @ 4K context)
 
@@ -416,7 +430,8 @@ Budget-aware eviction with protection zones:
 akv/
 ├── __init__.py           # Public API exports
 ├── drop_in.py            # AKVCache — zero-config drop-in for any HF model
-├── turbo_quant.py        # NormQuant — zero-calibration quantization engine
+├── affine_quantizer.py   # Block-affine quantizer (KIVI-style, default)
+├── turbo_quant.py        # Rotation-based quantizer (legacy, kept as fallback)
 ├── diagnostics.py        # Model diagnostics & preset recommendation
 ├── server.py             # OpenAI-compatible HTTP server (akv-server)
 ├── production_cache.py   # Production-grade cache with monitoring
@@ -466,10 +481,11 @@ notebooks/                # Experiment notebooks
 ## Citation
 
 ```bibtex
-@article{adaptive-kv-memory-2024,
-  title={Adaptive KV Memory: Hierarchical Cache Management for Long-Context LLM Inference},
-  year={2024},
-  note={Preprint}
+@article{akv-cache-2026,
+  title={AKV: A Virtual Memory System for LLM KV Cache with Retrieval-Preserving Hierarchical Compression},
+  author={Arvind S.},
+  year={2026},
+  url={https://github.com/Arvind679715/adaptive-kv-memory}
 }
 ```
 
