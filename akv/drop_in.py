@@ -91,19 +91,35 @@ _PRESETS = {
     "quality": {
         "warm_bits": 4,
         "hot_budget": 256,
-        "description": "Near-lossless 4-bit (NormQuant). +1-2% PPL.",
+        "description": "Near-lossless 4-bit. +1-2% PPL.",
     },
     # Best balance: +3-4% PPL, 5x memory reduction
     "balanced": {
         "warm_bits": 3,
         "hot_budget": 128,
-        "description": "NormQuant 3-bit. +3.3% PPL, 5x compression.",
+        "description": "Block-affine 3-bit. +3.3% PPL, 5x compression.",
     },
     # Maximum compression: +11% PPL, 8x memory reduction
     "compact": {
         "warm_bits": 2,
         "hot_budget": 64,
-        "description": "NormQuant 2-bit. +11% PPL, 8x compression.",
+        "description": "Block-affine 2-bit. +11% PPL, 8x compression.",
+    },
+    # Asymmetric: Keys at 4-bit, Values at 2-bit (keys more sensitive)
+    "k4v2": {
+        "warm_bits": 4,
+        "warm_key_bits": 4,
+        "warm_value_bits": 2,
+        "hot_budget": 128,
+        "description": "Asymmetric K4/V2. Keys preserved, values aggressively compressed.",
+    },
+    # Asymmetric: Keys at 4-bit, Values at 3-bit
+    "k4v3": {
+        "warm_bits": 4,
+        "warm_key_bits": 4,
+        "warm_value_bits": 3,
+        "hot_budget": 128,
+        "description": "Asymmetric K4/V3. Near-quality keys with balanced value compression.",
     },
 }
 
@@ -170,6 +186,11 @@ class AKVLayer(_get_dynamic_layer_base()):
         # at prefill before promotion has a chance to fire. Set to 0.25
         # to enable the policy proposed in paper §7; default 0 (off).
         adaptive_hot_frac: float = 0.0,
+        # ---- New: asymmetric K/V bits ----
+        warm_key_bits: Optional[int] = None,
+        warm_value_bits: Optional[int] = None,
+        # ---- New: outlier channel protection ----
+        outlier_fraction: float = 0.0,
     ):
         # Initialise CacheLayerMixin/DynamicLayer state (self.keys=None,
         # self.values=None, self.is_initialized=False, etc.). Skip when the
@@ -192,6 +213,10 @@ class AKVLayer(_get_dynamic_layer_base()):
         self.enable_promotion_proxy = enable_promotion_proxy
         self.proxy_decay = proxy_decay
         self.adaptive_hot_frac = adaptive_hot_frac
+        # Asymmetric K/V bits
+        self.warm_key_bits = warm_key_bits or warm_bits
+        self.warm_value_bits = warm_value_bits or warm_bits
+        self.outlier_fraction = outlier_fraction
         # Per-head bit override from calibration. If set, the demotion path
         # quantizes each KV-head with its own bit-width instead of using the
         # single global `warm_bits` value.
@@ -243,19 +268,23 @@ class AKVLayer(_get_dynamic_layer_base()):
         self._quantizer = None
         self._quantizer_pool: dict[int, object] = {}
 
-    def _make_quantizer(self, bits: int):
+    def _make_quantizer(self, bits: int, key_bits: int | None = None,
+                        value_bits: int | None = None):
         """Construct quantizer at a given bit-width, or None.
 
         Uses the block-affine quantizer (KIVI-style) by default for
         robust low-bit quality. Falls back to TurboQuantizer only if
         AffineQuantizer is unavailable.
         """
+        kb = key_bits if key_bits is not None else bits
+        vb = value_bits if value_bits is not None else bits
         try:
             from akv.affine_quantizer import AffineQuantizer, AffineQuantConfig
             return AffineQuantizer(AffineQuantConfig(
-                key_bits=bits,
-                value_bits=bits,
+                key_bits=kb,
+                value_bits=vb,
                 group_size=self.group_size,
+                outlier_fraction=self.outlier_fraction,
             ))
         except ImportError:
             pass
@@ -273,7 +302,11 @@ class AKVLayer(_get_dynamic_layer_base()):
     def _ensure_quantizer(self, head_dim: int, device):
         """Lazy-init the default NormQuant quantizer (and the per-head pool)."""
         if self._quantizer is None:
-            self._quantizer = self._make_quantizer(self.warm_bits)
+            self._quantizer = self._make_quantizer(
+                self.warm_bits,
+                key_bits=self.warm_key_bits,
+                value_bits=self.warm_value_bits,
+            )
         if self.per_head_bits:
             for b in set(self.per_head_bits):
                 if b not in self._quantizer_pool:
@@ -301,8 +334,8 @@ class AKVLayer(_get_dynamic_layer_base()):
             qk = self._quantizer.quantize_keys(k.squeeze(0))
             qv = self._quantizer.quantize_values(v.squeeze(0))
             packed_bytes = (
-                measure_packed_bytes(qk, self.warm_bits)
-                + measure_packed_bytes(qv, self.warm_bits)
+                measure_packed_bytes(qk, self.warm_key_bits)
+                + measure_packed_bytes(qv, self.warm_value_bits)
             )
             return (
                 self._quantizer.dequantize_keys(qk).unsqueeze(0),
@@ -878,8 +911,11 @@ class AKVCache(_get_dynamic_cache_base()):
         self,
         preset: Optional[str] = None,
         warm_bits: Optional[int] = None,
+        warm_key_bits: Optional[int] = None,
+        warm_value_bits: Optional[int] = None,
         hot_budget: Optional[int] = None,
         group_size: int = 64,
+        outlier_fraction: float = 0.0,
         protect_first: int = 0,
         protect_last: int = 0,
         protect_layers: Optional[list] = None,
@@ -909,7 +945,17 @@ class AKVCache(_get_dynamic_cache_base()):
             self.warm_bits = warm_bits or 3
             self.hot_budget = hot_budget or 128
 
+        # Asymmetric K/V bit-widths (override warm_bits per-component)
+        # Presets can define warm_key_bits/warm_value_bits directly
+        if preset and "warm_key_bits" in _PRESETS.get(preset, {}):
+            self.warm_key_bits = _PRESETS[preset]["warm_key_bits"]
+            self.warm_value_bits = _PRESETS[preset]["warm_value_bits"]
+        else:
+            self.warm_key_bits = warm_key_bits or self.warm_bits
+            self.warm_value_bits = warm_value_bits or self.warm_bits
+
         self.group_size = group_size
+        self.outlier_fraction = outlier_fraction
         self.num_hidden_layers = num_hidden_layers
         self.enable_promotion = enable_promotion
         self.promotion_threshold = promotion_threshold
@@ -1034,6 +1080,9 @@ class AKVCache(_get_dynamic_cache_base()):
                 enable_promotion_proxy=self.enable_promotion_proxy,
                 proxy_decay=self.proxy_decay,
                 adaptive_hot_frac=self.adaptive_hot_frac,
+                warm_key_bits=self.warm_key_bits,
+                warm_value_bits=self.warm_value_bits,
+                outlier_fraction=self.outlier_fraction,
                 per_head_bits=self._calibration_per_head_bits.get(idx)
                 if self._calibration_per_head_bits else None,
             ))
@@ -1106,6 +1155,29 @@ class AKVCache(_get_dynamic_cache_base()):
         )
         totals["num_layers"] = len(self.layers)
         return totals
+
+    def memory_report(self) -> dict:
+        """User-friendly memory report with compression stats.
+
+        Returns a dict with:
+            compressed_bytes: actual packed memory usage
+            fp16_equiv_bytes: memory without compression
+            savings_ratio: compression factor (e.g. 3.5x)
+            key_bits: current key quantization bit-width
+            value_bits: current value quantization bit-width
+            num_layers: number of active layers
+            seq_length: current sequence length (layer 0)
+        """
+        stats = self.memory_usage()
+        return {
+            "compressed_bytes": stats["total_bytes"],
+            "fp16_equiv_bytes": stats["fp16_equivalent_bytes"],
+            "savings_ratio": round(stats["savings_ratio"], 2),
+            "key_bits": self.warm_key_bits,
+            "value_bits": self.warm_value_bits,
+            "num_layers": stats["num_layers"],
+            "seq_length": self.get_seq_length(0),
+        }
 
     # --- DynamicCache compatibility ---
 

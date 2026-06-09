@@ -35,6 +35,14 @@ We introduce **Adaptive KV Memory (AKV)**, a hierarchical KV cache management sy
 - **DynamicCache subclass** — fully compatible with beam search, `generate()`, and all HF generation strategies.
 - **O(1) decode scaling** — bounded working set gives constant throughput regardless of total context.
 
+## What's New in v1.4.0
+
+- **Bit-packed storage** — Quantized codes are now stored at their native bit-width (4→2x, 3→2.67x, 2→4x compression of codes) via `akv.bitpack`. No more uint8 waste.
+- **Asymmetric K/V bit-widths** — `AKVCache(warm_key_bits=4, warm_value_bits=2)` or use the new `k4v2`/`k4v3` presets. Keys are more sensitive to quantization than values.
+- **Outlier channel protection** — `AKVCache(outlier_fraction=0.01)` keeps the top 1% highest-variance channels at FP16, eliminating long-tail quantization errors at 2-3 bits.
+- **`memory_report()`** — User-friendly method returning compressed bytes, FP16 equivalent, and savings ratio.
+- **New presets** — `k4v2` (asymmetric K4/V2) and `k4v3` (K4/V3) for fine-grained memory/quality tradeoffs.
+
 ## What's New in v1.3.0
 
 - **Block-affine quantizer** (`AffineQuantizer`) — replaces rotation-based TurboQuantizer as default warm-tier quantizer. Per-channel asymmetric for keys, per-token asymmetric for values. Fixes catastrophic 3-bit PPL regression (17,348 → 8.83).
@@ -244,6 +252,8 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 | `quality` | 4-bit | 256 tokens | Minimal quality loss |
 | `balanced` | 3-bit | 128 tokens | Default — good tradeoff |
 | `compact` | 2-bit | 64 tokens | Maximum memory savings |
+| `k4v2` | K:4-bit V:2-bit | 128 tokens | Asymmetric — keys preserved |
+| `k4v3` | K:4-bit V:3-bit | 128 tokens | Near-quality with value compression |
 
 ### Model-Aware Setup
 
@@ -257,6 +267,20 @@ List supported families from the CLI:
 
 ```bash
 akv adapters --verbose
+```
+
+### Asymmetric K/V + Outlier Protection (New in v1.4.0)
+
+```python
+# Asymmetric: keys at 4-bit (sensitive), values at 2-bit (tolerant)
+cache = AKVCache(preset="k4v2")
+
+# Or explicit control with outlier protection:
+cache = AKVCache(warm_key_bits=4, warm_value_bits=3, outlier_fraction=0.01)
+
+# Check memory savings at runtime:
+report = cache.memory_report()
+print(f"Compression: {report['savings_ratio']}x | K:{report['key_bits']}b V:{report['value_bits']}b")
 ```
 
 ### Per-Head Calibration (New in v1.2.0)

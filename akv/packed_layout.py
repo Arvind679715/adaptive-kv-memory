@@ -513,19 +513,29 @@ def measure_packed_bytes(qdata: dict, bits: int) -> int:
     actually keep in memory for this quantization event. Using this
     instead of a closed-form formula gives honest, measured compression
     numbers in ``AKVLayer.memory_usage_bytes``.
+
+    If the qdata dict contains a ``'bits'`` key, the codes are assumed
+    to be already packed (e.g. from AffineQuantizer with packed=True)
+    and are counted directly without re-packing.
     """
     if 'codes' not in qdata:
         return 0
     codes = qdata['codes']
-    if bits == 4:
-        packed = pack_uint4(codes)
-    elif bits == 3:
-        packed = pack_uint3(codes)
-    elif bits == 2:
-        packed = pack_uint2(codes)
+
+    # If already packed (AffineQuantizer with packed=True stores 'bits' key)
+    if 'bits' in qdata:
+        total = codes.element_size() * codes.numel()
     else:
-        packed = codes
-    total = packed.element_size() * packed.numel()
+        if bits == 4:
+            packed = pack_uint4(codes)
+        elif bits == 3:
+            packed = pack_uint3(codes)
+        elif bits == 2:
+            packed = pack_uint2(codes)
+        else:
+            packed = codes
+        total = packed.element_size() * packed.numel()
+
     for key in ('group_mean', 'group_std', 'scale', 'zero'):
         t = qdata.get(key)
         if isinstance(t, torch.Tensor):

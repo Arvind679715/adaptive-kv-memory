@@ -946,16 +946,18 @@ For real inference workloads, the decode path achieves zero dynamic allocation:
 
 \subsection{Warm-Tier Storage Layout}
 
-The warm tier stores quantized tensors as packed integer codes plus per-axis scale/zero side information:
+The warm tier stores quantized tensors as \textbf{bit-packed} integer codes plus per-axis scale/zero side information. Codes are packed at their native bit-width (4-bit: 2 values/byte, 3-bit: 8 values/3 bytes, 2-bit: 4 values/byte), eliminating the uint8 waste of na\"ive implementations:
 
 \begin{verbatim}
-_k_codes:  (num_heads, max_seq_len, head_dim)         uint8
-_k_scale:  (num_heads, 1, head_dim)                   fp16
-_k_zero:   (num_heads, 1, head_dim)                   fp16
-_v_codes:  (num_heads, max_seq_len, head_dim)         uint8
-_v_scale:  (num_heads, max_seq_len, 1)                fp16
-_v_zero:   (num_heads, max_seq_len, 1)                fp16
+_k_codes:  (num_heads, max_seq_len, head_dim//pack_factor)  uint8 packed
+_k_scale:  (num_heads, 1, head_dim)                         fp16
+_k_zero:   (num_heads, 1, head_dim)                         fp16
+_v_codes:  (num_heads, max_seq_len, head_dim//pack_factor)  uint8 packed
+_v_scale:  (num_heads, max_seq_len, 1)                      fp16
+_v_zero:   (num_heads, max_seq_len, 1)                      fp16
 \end{verbatim}
+
+where \texttt{pack\_factor} $= 8 / \text{bits}$ (2 for 4-bit, $8/3$ for 3-bit, 4 for 2-bit). Keys and values may use different bit-widths (asymmetric K/V configuration, e.g.\ K4V2), reflecting the empirical observation that keys are more sensitive to quantization noise than values.
 
 For Qwen2.5-1.5B with head\_dim=128 and 2 KV heads, the per-demotion-batch overhead is 2$\times$128$\times$2 = 512 bytes for key scale/zero (shared across all tokens in the batch) and 2$\times$N$\times$2 = 4N bytes for value scale/zero (one per token).
 
