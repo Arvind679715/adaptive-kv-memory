@@ -153,3 +153,57 @@ class TestScoringStrategies:
             scores = scorer.get_scores(0)
             assert scores is not None
             assert scores.shape[0] == 32
+
+
+class TestObservationWindowStrategy:
+    """The observation-window strategy scores keys using only the most recent
+    query positions (plus spatial pooling), which is more predictive of future
+    decoding than an equal-weighted average over the whole prompt."""
+
+    def _attn_with_shifting_focus(self, kv_len=20, q_len=8):
+        # Early queries attend to key 3; the recent observation window (last 2
+        # queries) attends to key 14. An equal-weight sum over all queries
+        # dilutes key 14; an observation window surfaces it.
+        attn = torch.full((1, 2, q_len, kv_len), 0.001)
+        attn[:, :, :q_len - 2, 3] = 1.0
+        attn[:, :, q_len - 2:, 14] = 1.0
+        attn = attn / attn.sum(dim=-1, keepdim=True)
+        return attn
+
+    def test_observation_window_surfaces_recent_focus(self):
+        attn = self._attn_with_shifting_focus()
+
+        obs = ImportanceScorer(ImportanceConfig(
+            strategy=ScoringStrategy.OBSERVATION_WINDOW,
+            observation_window=2,
+            pooling_kernel=1,
+        ))
+        obs.update(attn, layer_idx=0)
+        # Key 14 (recent focus) should outrank key 3 (stale focus).
+        obs_scores = obs.get_scores(0)
+        assert obs_scores[14] > obs_scores[3]
+
+        # A plain equal-weight accumulation does the opposite (key 3 dominates).
+        acc = ImportanceScorer(ImportanceConfig(
+            strategy=ScoringStrategy.ATTENTION_ACCUMULATION,
+        ))
+        acc.update(attn, layer_idx=0)
+        acc_scores = acc.get_scores(0)
+        assert acc_scores[3] > acc_scores[14]
+
+    def test_pooling_elevates_neighbours_of_a_spike(self):
+        # Single-query attention spiking on key 10; pooling should raise its
+        # immediate neighbours above unrelated distant keys.
+        attn = torch.full((1, 1, 1, 20), 0.001)
+        attn[:, :, :, 10] = 1.0
+        attn = attn / attn.sum(dim=-1, keepdim=True)
+
+        scorer = ImportanceScorer(ImportanceConfig(
+            strategy=ScoringStrategy.OBSERVATION_WINDOW,
+            observation_window=1,
+            pooling_kernel=5,
+        ))
+        scorer.update(attn, layer_idx=0)
+        scores = scorer.get_scores(0)
+        assert scores[9] > scores[2]
+        assert scores[11] > scores[2]

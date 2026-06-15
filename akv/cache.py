@@ -19,7 +19,7 @@ from typing import Optional
 import torch
 
 from akv.quantizer import KVQuantizer, QuantConfig, QuantizedTensor
-from akv.importance import ImportanceScorer, ImportanceConfig
+from akv.importance import ImportanceScorer, ImportanceConfig, ScoringStrategy
 from akv.evictor import AdaptiveEvictor, EvictionConfig
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,9 @@ class CacheConfig:
     recent_tokens_protected: int = 32
     importance_decay: float = 0.3
     n_anchors: int = 16
-    scoring_strategy: str = "importance"  # "importance" or "fifo"
+    scoring_strategy: str = "hybrid"  # "hybrid", "importance", "observation_window", "fifo"
+    observation_window: int = 32  # used by the observation_window strategy
+    pooling_kernel: int = 7       # used by the observation_window strategy
 
 
 class _LayerCache:
@@ -100,9 +102,12 @@ class AdaptiveKVCache:
             group_size=self.config.group_size,
         ))
         self._scorer = ImportanceScorer(ImportanceConfig(
+            strategy=ScoringStrategy(self.config.scoring_strategy),
             decay_factor=self.config.importance_decay,
             initial_tokens_protected=self.config.initial_tokens_protected,
             recent_tokens_protected=self.config.recent_tokens_protected,
+            observation_window=self.config.observation_window,
+            pooling_kernel=self.config.pooling_kernel,
         ))
         self._evictor = AdaptiveEvictor(
             EvictionConfig(

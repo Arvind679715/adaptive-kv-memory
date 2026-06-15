@@ -23,6 +23,7 @@ class ScoringStrategy(str, Enum):
     HYBRID = "hybrid"
     IMPORTANCE = "importance"  # Last-query-position attention with fast decay + anchors
     FIFO = "fifo"  # Evict oldest unprotected tokens first
+    OBSERVATION_WINDOW = "observation_window"  # SnapKV/PyramidKV-style: last-W queries + pooling
 
 
 @dataclass
@@ -34,6 +35,11 @@ class ImportanceConfig:
     window_size: int = 64
     initial_tokens_protected: int = 4
     recent_tokens_protected: int = 32
+    # Observation-window strategy: how many of the most recent query positions
+    # are used to score keys (recent queries best predict future generation),
+    # and the pooling kernel that captures contiguous important spans.
+    observation_window: int = 32
+    pooling_kernel: int = 7
 
 
 class ImportanceScorer:
@@ -86,6 +92,24 @@ class ImportanceScorer:
         key_importance = avg_attn.sum(dim=0)
 
         kv_len = key_importance.shape[0]
+        cfg_obs = self.config
+        if cfg_obs.strategy == ScoringStrategy.OBSERVATION_WINDOW:
+            # Score keys using only the most recent query positions (the
+            # observation window). Recent queries are far more predictive of
+            # which keys future decoding will attend to than an equal-weighted
+            # average over the whole prompt -- this is the selection signal
+            # that makes SnapKV/PyramidKV stronger than a plain attention EMA.
+            q_len = avg_attn.shape[0]
+            w = min(cfg_obs.observation_window, q_len)
+            key_importance = avg_attn[q_len - w:, :].sum(dim=0)
+            # Spatial pooling so a key is kept together with its neighbours
+            # (information needed for one fact usually spans adjacent tokens).
+            ks = cfg_obs.pooling_kernel
+            if ks > 1 and kv_len > ks:
+                pooled = torch.nn.functional.avg_pool1d(
+                    key_importance.view(1, 1, -1), ks, stride=1, padding=ks // 2,
+                ).view(-1)
+                key_importance = pooled[:kv_len]
         device = key_importance.device
 
         if layer_idx not in self._scores or self._scores[layer_idx].shape[0] < kv_len:
@@ -128,6 +152,11 @@ class ImportanceScorer:
         elif cfg.strategy == ScoringStrategy.IMPORTANCE:
             # Importance-aware: EMA of last-query-position attention with fast decay
             # Tokens with high cumulative attention are anchored in the hot tier
+            scores[:kv_len] = scores[:kv_len] * cfg.decay_factor + key_importance
+
+        elif cfg.strategy == ScoringStrategy.OBSERVATION_WINDOW:
+            # EMA over the observation-window-weighted, pooled key importance
+            # computed above.
             scores[:kv_len] = scores[:kv_len] * cfg.decay_factor + key_importance
 
         self._scores[layer_idx] = scores
